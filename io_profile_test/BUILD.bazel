@@ -1,0 +1,2 @@
+# Keep the Android user-space probe out of the parent kernel-module glob.
+package(default_visibility = ["//visibility:private"])

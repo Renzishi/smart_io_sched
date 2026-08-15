@@ -4,6 +4,9 @@
 
 #include "io_semantics.h"
 #include "smart_io_log.h"
+#include "smart_io_throttle.h"
+#include "smart_io_types.h"
+#include "trace_instance.h"
 
 static void tp_rq_insert_cb(void *ignore, struct request *rq)
 {
@@ -12,18 +15,20 @@ static void tp_rq_insert_cb(void *ignore, struct request *rq)
 
 static void tp_rq_issue_cb(void *ignore, struct request *rq)
 {
+	smart_io_throttle_record_issue(rq);
 	smart_io_record_issue(rq);
 }
 
 static void tp_rq_requeue_cb(void *ignore, struct request *rq)
 {
+	smart_io_throttle_record_requeue(rq);
 	smart_io_record_requeue(rq);
 }
 
 static void tp_rq_complete_cb(void *ignore, struct request *rq,
 			      blk_status_t status, unsigned int nr_bytes)
 {
-	(void)status;
+	smart_io_throttle_record_complete(rq, status, nr_bytes);
 	smart_io_record_complete(rq, nr_bytes);
 }
 

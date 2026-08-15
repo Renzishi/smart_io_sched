@@ -89,6 +89,7 @@ struct smart_io_state_snapshot {
 	u32 device_q_fg_count;
 	u32 device_q_slow_count;
 	u32 queue_max;
+	u32 dev_lat_threshold_us;
 	u32 window_complete_count;
 	u32 window_mean_dev_us;
 	u32 window_span_us;
@@ -179,6 +180,7 @@ struct smart_io_throttle_ctx {
 	u32 pending_medium_pct;
 	u32 pending_heavy_pct;
 	bool inference_timed_out;
+	bool inference_running;
 
 	struct workqueue_struct *inference_wq;
 	struct workqueue_struct *timeout_wq;
@@ -273,8 +275,15 @@ void smart_io_throttle_finish_request(struct smart_io_throttle_ctx *ctx,
 
 enum smart_io_rq_class smart_io_throttle_rq_class(const struct request *rq);
 bool smart_io_throttle_enabled(void);
+int smart_io_throttle_set_queue_rq_demo(bool enabled);
+bool smart_io_throttle_get_queue_rq_demo(void);
+bool smart_io_throttle_ufs_should_requeue(struct request *rq);
 bool smart_io_throttle_has_pending(struct smart_io_throttle_ctx *ctx,
 				   enum smart_io_rq_class class);
+void smart_io_throttle_dispatch_model_if_needed(
+		struct smart_io_throttle_ctx *ctx);
+bool smart_io_throttle_model_dispatch_needed(
+		struct smart_io_throttle_ctx *ctx);
 bool smart_io_throttle_background_allowed(struct smart_io_throttle_ctx *ctx);
 bool smart_io_throttle_deadline_escape_available(
 		struct smart_io_throttle_ctx *ctx);

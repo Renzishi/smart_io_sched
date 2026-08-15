@@ -1,0 +1,10 @@
+load("//build/kernel/kleaf:kernel.bzl", "ddk_module")
+
+ddk_module(
+    name = "smart_io_latency_test",
+    srcs = ["smart_io_latency_test.c"],
+    hdrs = ["smart_io_latency_uapi.h"],
+    out = "smart_io_latency_test.ko",
+    kernel_build = "//common:kernel_aarch64",
+    deps = ["//common:all_headers_aarch64"],
+)

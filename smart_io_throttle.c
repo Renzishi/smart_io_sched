@@ -1,5 +1,8 @@
 // SPDX-License-Identifier: GPL-2.0
+#include <asm/simd.h>
+
 #include <linux/cred.h>
+#include <linux/build_bug.h>
 #include <linux/errno.h>
 #include <linux/jiffies.h>
 #include <linux/kernel.h>
@@ -13,12 +16,13 @@
 
 #include <block/blk.h>
 
+#include "smart_io_model_fp32.h"
 #include "smart_io_throttle.h"
 #include "system_context.h"
 #include "trace_instance.h"
 
 // #define SMART_IO_DEFAULT_DEV_LAT_US 4000U
-#define SMART_IO_DEFAULT_DEV_LAT_US 1500U
+#define SMART_IO_DEFAULT_DEV_LAT_US 800U
 #define SMART_IO_DEFAULT_LIGHT_PCT 75U
 #define SMART_IO_DEFAULT_MEDIUM_PCT 50U
 #define SMART_IO_DEFAULT_HEAVY_PCT 25U
@@ -34,6 +38,7 @@ struct smart_io_throttle_config {
 };
 
 static atomic_t throttle_enabled = ATOMIC_INIT(0);
+static atomic_t queue_rq_throttle_demo = ATOMIC_INIT(0);
 static atomic_t dev_lat_threshold_us = ATOMIC_INIT(SMART_IO_DEFAULT_DEV_LAT_US);
 static atomic_t background_deadline_ms =
 	ATOMIC_INIT(SMART_IO_DEFAULT_BACKGROUND_DEADLINE_MS);
@@ -97,6 +102,10 @@ static const char * const selection_names[] = {
 	[SMART_IO_SELECTION_BACKGROUND_BASELINE] = "background_baseline",
 	[SMART_IO_SELECTION_BACKGROUND_DEADLINE] = "background_deadline",
 };
+
+static_assert(SMART_IO_MODEL_FP32_INPUTS == 11U);
+static_assert(SMART_IO_MODEL_FP32_ACTIONS ==
+	      SMART_IO_THROTTLE_LEVEL_COUNT * SMART_IO_DISPATCH_POLICY_COUNT);
 
 static struct smart_io_throttle_ctx *
 smart_io_throttle_find_ctx_rcu(struct request_queue *q)
@@ -289,6 +298,7 @@ static bool smart_io_throttle_fallback_locked(struct smart_io_throttle_ctx *ctx)
 	ctx->throttle_active = false;
 	ctx->inference_pending = false;
 	ctx->inference_timed_out = false;
+	ctx->inference_running = false;
 	ctx->action_valid = false;
 	ctx->pending_state_valid = false;
 	ctx->gate_blocked = false;
@@ -313,16 +323,22 @@ static void smart_io_throttle_trace_decision(struct smart_io_throttle_ctx *ctx,
 					      const char *result,
 					      u64 session_id,
 					      u64 control_id,
-					      u64 decision_id,
-					      const struct smart_io_action *action)
+				      u64 decision_id,
+				      const struct smart_io_action *action)
 {
+	u32 action_id = action->level * SMART_IO_DISPATCH_POLICY_COUNT +
+		action->policy;
+	const char *model_impl = ctx->pending_source ==
+		SMART_IO_ACTION_SOURCE_MODEL ? "fp32_joint_11x32x32x12" : "none";
+
 	if (unlikely(atomic_read(&rawdata_trace_enabled) == 0))
 		return;
 
-	smart_io_raw_emit("io_throttle_decision: ts_ns=%llu queue=%p session_id=%llu control_id=%llu decision_id=%llu trigger=%s result=%s source=%s level=%s policy=%s ratio_pct=%u queue_max=%u target_depth=%u current_depth=%u reserved_depth=%u issued_depth=%u\n",
+	smart_io_raw_emit("io_throttle_decision: ts_ns=%llu queue=%p session_id=%llu control_id=%llu decision_id=%llu trigger=%s result=%s source=%s model_impl=%s action_id=%u level=%s policy=%s ratio_pct=%u queue_max=%u target_depth=%u current_depth=%u reserved_depth=%u issued_depth=%u\n",
 			  ktime_get_boottime_ns(), ctx->queue, session_id,
 			  control_id, decision_id, trigger, result,
 			  smart_io_action_source_name(ctx->pending_source),
+			  model_impl, action_id,
 			  smart_io_throttle_level_name(action->level),
 			  smart_io_dispatch_policy_name(action->policy),
 			  action->ratio_pct, action->queue_max, action->target_depth,
@@ -341,7 +357,7 @@ static void smart_io_throttle_trace_state(
 	smart_io_raw_emit("io_rl_state: decision_ts_ns=%llu queue=%p session_id=%llu control_id=%llu decision_id=%llu valid=%u threshold_us=%u device_q_count=%u reserved_depth_count=%u device_q_fg_count=%u device_q_slow_count=%u queue_max=%u window_complete_count=%u window_mean_dev_us=%u window_span_us=%u window_slow_count=%u window_fg_complete_count=%u waiting_total_count=%u waiting_count=%u waiting_fg=%u waiting_high_ioprio_count=%u waiting_to_issued_contiguous_count=%u\n",
 			  state->decision_ts_ns, ctx->queue, session_id,
 			  control_id, decision_id, valid ? 1U : 0U,
-			  smart_io_throttle_get_dev_lat_threshold(),
+			  state->dev_lat_threshold_us,
 			  state->device_q_count, state->reserved_depth_count,
 			  state->device_q_fg_count,
 			  state->device_q_slow_count, state->queue_max,
@@ -669,6 +685,7 @@ static bool smart_io_throttle_start_inference_locked(struct smart_io_throttle_ct
 	ctx->throttle_active = true;
 	ctx->inference_pending = true;
 	ctx->inference_timed_out = false;
+	ctx->inference_running = false;
 	ctx->action_valid = false;
 	ctx->pending_state_valid = false;
 	smart_io_throttle_reset_feedback_locked(ctx);
@@ -713,6 +730,22 @@ static bool smart_io_throttle_action_valid(const struct smart_io_action *action)
 		action->policy < SMART_IO_DISPATCH_POLICY_COUNT;
 }
 
+static int smart_io_throttle_model_fp32_action(
+		const struct smart_io_state_snapshot *state,
+		struct smart_io_action *action,
+		struct smart_io_model_fp32_timing *timing)
+{
+	u32 action_id;
+	int ret;
+
+	ret = smart_io_model_fp32_predict_timed(state, &action_id, timing);
+	if (ret)
+		return ret;
+	action->level = action_id / SMART_IO_DISPATCH_POLICY_COUNT;
+	action->policy = action_id % SMART_IO_DISPATCH_POLICY_COUNT;
+	return 0;
+}
+
 static u32 smart_io_throttle_action_ratio(const struct smart_io_throttle_ctx *ctx,
 						   enum smart_io_throttle_level level)
 {
@@ -742,11 +775,16 @@ static void smart_io_throttle_inference_work(struct work_struct *work)
 	enum smart_io_action_source source;
 	u32 queue_max;
 	u32 ratio_pct;
+	u64 inference_start_ns;
+	u64 inference_elapsed_ns;
+	struct smart_io_model_fp32_timing model_timing;
+	bool trace_model_timing;
 	bool wake = false;
 	int ret = 0;
 
 	spin_lock_irqsave(&ctx->lock, flags);
 	if (!ctx->inference_pending || ctx->inference_timed_out || ctx->dying) {
+		ctx->inference_running = false;
 		spin_unlock_irqrestore(&ctx->lock, flags);
 		return;
 	}
@@ -757,6 +795,7 @@ static void smart_io_throttle_inference_work(struct work_struct *work)
 	action = ctx->pending_fixed_action;
 	state = ctx->pending_state;
 	if (!ctx->pending_state_valid) {
+		ctx->inference_running = false;
 		spin_unlock_irqrestore(&ctx->lock, flags);
 		return;
 	}
@@ -764,8 +803,27 @@ static void smart_io_throttle_inference_work(struct work_struct *work)
 	smart_io_throttle_trace_state(ctx, &state, session_id, control_id,
 				      decision_id, true);
 
-	if (source == SMART_IO_ACTION_SOURCE_MODEL)
-		ret = -EOPNOTSUPP;
+	if (source == SMART_IO_ACTION_SOURCE_MODEL) {
+		trace_model_timing = atomic_read(&rawdata_trace_enabled) != 0;
+		inference_start_ns = ktime_get_ns();
+		ret = smart_io_throttle_model_fp32_action(&state, &action,
+						   trace_model_timing ? &model_timing : NULL);
+		inference_elapsed_ns = ktime_get_ns() - inference_start_ns;
+		if (!ret && inference_elapsed_ns >
+		    (u64)SMART_IO_INFERENCE_TIMEOUT_MS * NSEC_PER_MSEC)
+			ret = -ETIMEDOUT;
+		if (unlikely(trace_model_timing))
+			smart_io_raw_emit("io_model_inference: session_id=%llu control_id=%llu decision_id=%llu input_prepare_ns=%llu simd_check_ns=%llu neon_begin_ns=%llu forward_ns=%llu neon_end_ns=%llu output_check_ns=%llu predict_total_ns=%llu elapsed_ns=%llu ret=%d\n",
+					  session_id, control_id, decision_id,
+					  model_timing.input_prepare_ns,
+					  model_timing.simd_check_ns,
+					  model_timing.neon_begin_ns,
+					  model_timing.forward_ns,
+					  model_timing.neon_end_ns,
+					  model_timing.output_check_ns,
+					  model_timing.total_ns,
+					  inference_elapsed_ns, ret);
+	}
 	else if (!smart_io_throttle_action_valid(&action))
 		ret = -EINVAL;
 
@@ -783,6 +841,7 @@ static void smart_io_throttle_inference_work(struct work_struct *work)
 	    session_id != ctx->pending_session_id ||
 	    control_id != ctx->pending_control_id ||
 	    decision_id != ctx->pending_decision_id) {
+		ctx->inference_running = false;
 		spin_unlock_irqrestore(&ctx->lock, flags);
 		return;
 	}
@@ -823,6 +882,7 @@ static void smart_io_throttle_inference_work(struct work_struct *work)
 	ctx->action_valid = true;
 	ctx->inference_pending = false;
 	ctx->inference_timed_out = false;
+	ctx->inference_running = false;
 	ctx->feedback_state = SMART_IO_FEEDBACK_WAIT_DISPATCH;
 	ctx->inference_count++;
 	ctx->gate_blocked = false;
@@ -849,6 +909,49 @@ fallback:
 					  session_id, control_id, decision_id, &action);
 	if (wake)
 		blk_mq_run_hw_queues(ctx->queue, true);
+}
+
+static bool smart_io_throttle_model_dispatch_needed_locked(
+		const struct smart_io_throttle_ctx *ctx)
+{
+	return ctx->inference_pending && !ctx->inference_running &&
+		ctx->pending_state_valid &&
+		ctx->pending_source == SMART_IO_ACTION_SOURCE_MODEL &&
+		ctx->pending_bg;
+}
+
+bool smart_io_throttle_model_dispatch_needed(struct smart_io_throttle_ctx *ctx)
+{
+	unsigned long flags;
+	bool needed;
+
+	if (!ctx || !smart_io_throttle_enabled())
+		return false;
+
+	spin_lock_irqsave(&ctx->lock, flags);
+	needed = smart_io_throttle_model_dispatch_needed_locked(ctx);
+	spin_unlock_irqrestore(&ctx->lock, flags);
+	return needed;
+}
+
+void smart_io_throttle_dispatch_model_if_needed(
+		struct smart_io_throttle_ctx *ctx)
+{
+	unsigned long flags;
+	bool run = false;
+
+	if (!ctx || !smart_io_throttle_enabled())
+		return;
+
+	spin_lock_irqsave(&ctx->lock, flags);
+	if (smart_io_throttle_model_dispatch_needed_locked(ctx)) {
+		ctx->inference_running = true;
+		run = true;
+	}
+	spin_unlock_irqrestore(&ctx->lock, flags);
+
+	if (run)
+		smart_io_throttle_inference_work(&ctx->inference_work);
 }
 
 static void smart_io_throttle_timeout_work(struct work_struct *work)
@@ -1279,6 +1382,45 @@ bool smart_io_throttle_enabled(void)
 	return atomic_read(&throttle_enabled) != 0;
 }
 
+int smart_io_throttle_set_queue_rq_demo(bool enabled)
+{
+	atomic_set(&queue_rq_throttle_demo, enabled ? 1 : 0);
+	return 0;
+}
+
+bool smart_io_throttle_get_queue_rq_demo(void)
+{
+	return atomic_read(&queue_rq_throttle_demo) != 0;
+}
+
+bool smart_io_throttle_ufs_should_requeue(struct request *rq)
+{
+	struct smart_io_throttle_ctx *ctx;
+	unsigned long flags;
+	bool requeue = false;
+
+	if (!rq || !rq->q || !smart_io_throttle_enabled() ||
+	    !smart_io_throttle_get_queue_rq_demo())
+		return false;
+
+	rcu_read_lock();
+	ctx = smart_io_throttle_find_ctx_rcu(rq->q);
+	if (!ctx)
+		goto unlock_rcu;
+
+	spin_lock_irqsave(&ctx->lock, flags);
+	if (ctx->throttle_active && ctx->action_valid &&
+	    !ctx->inference_pending &&
+	    ctx->action.level != SMART_IO_THROTTLE_NO &&
+	    ctx->issued_depth > ctx->action.target_depth)
+		requeue = true;
+	spin_unlock_irqrestore(&ctx->lock, flags);
+
+unlock_rcu:
+	rcu_read_unlock();
+	return requeue;
+}
+
 bool smart_io_throttle_has_pending(struct smart_io_throttle_ctx *ctx,
 				   enum smart_io_rq_class class)
 {
@@ -1306,10 +1448,11 @@ bool smart_io_throttle_background_allowed(struct smart_io_throttle_ctx *ctx)
 		return true;
 
 	spin_lock_irqsave(&ctx->lock, flags);
-	if (ctx->inference_pending) {
+	if (!smart_io_throttle_get_queue_rq_demo() && ctx->inference_pending) {
 		allowed = false;
 		reason = SMART_IO_GATE_INFERENCE;
-	} else if (!smart_io_throttle_depth_can_run_locked(ctx)) {
+	} else if (!smart_io_throttle_get_queue_rq_demo() &&
+		   !smart_io_throttle_depth_can_run_locked(ctx)) {
 		allowed = false;
 		reason = SMART_IO_GATE_DEPTH;
 	}
@@ -1514,6 +1657,7 @@ static bool smart_io_throttle_snapshot_state_locked(
 	memset(state, 0, sizeof(*state));
 	state->decision_ts_ns = now_ns;
 	state->queue_max = queue_max;
+	state->dev_lat_threshold_us = threshold_us;
 	if (!queue_max ||
 	    !smart_io_throttle_window_snapshot_locked(ctx, state, threshold_us))
 		return false;
@@ -1727,6 +1871,8 @@ void smart_io_throttle_record_complete(struct request *rq, blk_status_t status,
 	u64 session_id = 0;
 	u64 control_id = 0;
 	u64 decision_id = 0;
+	enum smart_io_action_source inference_source =
+		SMART_IO_ACTION_SOURCE_FIXED;
 	u32 latency_us = 0;
 	u32 threshold_us;
 	u32 current_depth = 0;
@@ -1844,6 +1990,7 @@ void smart_io_throttle_record_complete(struct request *rq, blk_status_t status,
 			session_id = ctx->pending_session_id;
 			control_id = ctx->pending_control_id;
 			decision_id = ctx->pending_decision_id;
+			inference_source = ctx->pending_source;
 			action = ctx->pending_fixed_action;
 		} else if (reinfer_requested) {
 			wake |= smart_io_throttle_fallback_locked(ctx);
@@ -1866,9 +2013,12 @@ void smart_io_throttle_record_complete(struct request *rq, blk_status_t status,
 	if (start_inference) {
 		smart_io_throttle_trace_decision(ctx,
 					 feedback_complete ? "feedback_slow" : "slow_window",
-					 "queued", session_id, control_id, decision_id,
+					 inference_source == SMART_IO_ACTION_SOURCE_MODEL ?
+					 "pending_dispatch" : "queued",
+					 session_id, control_id, decision_id,
 					 &action);
-		smart_io_throttle_schedule_inference(ctx);
+		if (inference_source != SMART_IO_ACTION_SOURCE_MODEL)
+			smart_io_throttle_schedule_inference(ctx);
 	}
 	if (released_reason != SMART_IO_GATE_NONE)
 		smart_io_throttle_trace_gate(ctx, "release", released_reason,

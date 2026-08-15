@@ -22,6 +22,8 @@ void smart_io_record_filemap_cache_delete(u32 pages);
 void smart_io_record_filemap_refault(u32 pages);
 void smart_io_record_filemap_fault(u64 wait_us);
 void smart_io_periodic_tick(void);
+bool smart_io_is_hot_inode(u64 inode_hash);
+u16 smart_io_hot_inode_ext(u64 inode_hash);
 void set_loadavg_1m_x100(u32 loadavg_1m_x100);
 void set_psi_io_x100(u32 psi_io_x100);
 u32 get_render_avg_lat(void);

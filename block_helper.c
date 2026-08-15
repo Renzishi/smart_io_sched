@@ -17,18 +17,22 @@
 static inline u16 get_file_ext_id(const char *ext)
 {
 	if (!ext)
-		return 0;
+		return SMART_IO_FILE_EXT_UNKNOWN;
 	if (!strcmp(ext, ".db"))
-		return 1;
+		return SMART_IO_FILE_EXT_DB;
 	if (!strcmp(ext, ".so"))
-		return 2;
+		return SMART_IO_FILE_EXT_SO;
 	if (!strcmp(ext, ".dex"))
-		return 3;
+		return SMART_IO_FILE_EXT_DEX;
 	if (!strcmp(ext, ".apk"))
-		return 4;
+		return SMART_IO_FILE_EXT_APK;
 	if (!strcmp(ext, ".log"))
-		return 5;
-	return 0;
+		return SMART_IO_FILE_EXT_LOG;
+	if (!strcmp(ext, ".vdex"))
+		return SMART_IO_FILE_EXT_VDEX;
+	if (!strcmp(ext, ".odex"))
+		return SMART_IO_FILE_EXT_ODEX;
+	return SMART_IO_FILE_EXT_UNKNOWN;
 }
 
 static inline const char *find_file_ext(const char *name)

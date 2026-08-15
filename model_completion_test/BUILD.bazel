@@ -1,0 +1,18 @@
+load("//build/kernel/kleaf:kernel.bzl", "ddk_module")
+
+ddk_module(
+    name = "smart_io_model_completion_test",
+    srcs = [
+        "smart_io_model_completion_test.c",
+        "smart_io_model_fp32.c",
+        "smart_io_model_fp32_asm.S",
+    ],
+    hdrs = [
+        "smart_io_model_fp32.h",
+        "smart_io_model_fp32_params.h",
+        "smart_io_throttle.h",
+    ],
+    out = "smart_io_fp32_completion_test.ko",
+    kernel_build = "//common:kernel_aarch64",
+    deps = ["//common:all_headers_aarch64"],
+)

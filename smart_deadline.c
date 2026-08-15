@@ -13,15 +13,19 @@
 #include <linux/slab.h>
 #include <linux/init.h>
 #include <linux/compiler.h>
+#include <linux/ktime.h>
 #include <linux/rbtree.h>
 #include <linux/sbitmap.h>
 
 #include <trace/events/block.h>
 
-#include "elevator.h"
-#include "blk.h"
-#include "blk-mq.h"
-#include "blk-mq-sched.h"
+#include <block/elevator.h>
+#include <block/blk.h>
+#include <block/blk-mq.h>
+#include <block/blk-mq-sched.h>
+
+#include "smart_deadline.h"
+#include "smart_io_throttle.h"
 
 /*
  * See Documentation/block/deadline-iosched.rst
@@ -70,6 +74,7 @@ struct io_stats_per_prio {
  * present on both sort_list[] and fifo_list[].
  */
 struct dd_per_prio {
+	struct smart_io_throttle_ctx *throttle;
 	struct list_head dispatch;
 	struct rb_root sort_list[DD_DIR_COUNT];
 	struct list_head fifo_list[DD_DIR_COUNT];
@@ -84,6 +89,7 @@ struct deadline_data {
 	 */
 
 	struct dd_per_prio per_prio[DD_PRIO_COUNT];
+	struct smart_io_throttle_ctx throttle;
 
 	/* Data direction of latest dispatched request. */
 	enum dd_data_dir last_dir;
@@ -200,6 +206,7 @@ static void dd_request_merged(struct request_queue *q, struct request *req,
 		elv_rb_del(deadline_rb_root(per_prio, req), req);
 		deadline_add_rq_rb(per_prio, req);
 	}
+	smart_io_throttle_update_request(&dd->throttle, req);
 }
 
 /*
@@ -214,6 +221,8 @@ static void dd_merged_requests(struct request_queue *q, struct request *req,
 
 	lockdep_assert_held(&dd->lock);
 
+	smart_io_throttle_update_request(&dd->throttle, req);
+	smart_io_throttle_unqueue_request(&dd->throttle, next);
 	dd->per_prio[prio].stats.merged++;
 
 	/*
@@ -255,6 +264,13 @@ static u32 dd_queued(struct deadline_data *dd, enum dd_prio prio)
 	lockdep_assert_held(&dd->lock);
 
 	return stats->inserted - atomic_read(&stats->completed);
+}
+
+static bool dd_has_work_for_prio(struct dd_per_prio *per_prio)
+{
+	return !list_empty_careful(&per_prio->dispatch) ||
+		!list_empty_careful(&per_prio->fifo_list[DD_READ]) ||
+		!list_empty_careful(&per_prio->fifo_list[DD_WRITE]);
 }
 
 /*
@@ -422,12 +438,249 @@ done:
 	return rq;
 }
 
+struct dd_candidate {
+	struct request *rq;
+	struct dd_per_prio *per_prio;
+	bool from_dispatch;
+};
+
+static struct request *dd_find_class_in_list(struct list_head *list,
+					      enum smart_io_rq_class class,
+					      struct deadline_data *dd,
+					      bool require_seq,
+					      unsigned int *budget)
+{
+	struct request *rq;
+
+	list_for_each_entry(rq, list, queuelist) {
+		if (!*budget)
+			return NULL;
+		(*budget)--;
+		if (smart_io_throttle_rq_class(rq) != class)
+			continue;
+		if (require_seq &&
+		    !smart_io_throttle_seq_match(&dd->throttle, rq))
+			continue;
+		return rq;
+	}
+
+	return NULL;
+}
+
+static bool dd_find_class_candidate(struct deadline_data *dd,
+				    enum smart_io_rq_class class,
+				    bool require_seq,
+				    struct dd_candidate *candidate)
+{
+	unsigned int budget = smart_io_throttle_scan_budget(&dd->throttle);
+	enum dd_prio prio;
+	struct request *read_rq;
+	struct request *write_rq;
+
+	for (prio = 0; prio <= DD_PRIO_MAX; prio++) {
+		read_rq = dd_find_class_in_list(&dd->per_prio[prio].dispatch,
+							class, dd, require_seq, &budget);
+		if (read_rq) {
+			candidate->rq = read_rq;
+			candidate->per_prio = &dd->per_prio[prio];
+			candidate->from_dispatch = true;
+			return true;
+		}
+	}
+
+	for (prio = 0; prio <= DD_PRIO_MAX; prio++) {
+		read_rq = dd_find_class_in_list(
+			&dd->per_prio[prio].fifo_list[DD_READ], class, dd,
+			require_seq, &budget);
+		write_rq = dd_find_class_in_list(
+			&dd->per_prio[prio].fifo_list[DD_WRITE], class, dd,
+			require_seq, &budget);
+		if (!read_rq && !write_rq)
+			continue;
+		candidate->rq = !read_rq ? write_rq : !write_rq ? read_rq :
+			time_before((unsigned long)read_rq->fifo_time,
+				    (unsigned long)write_rq->fifo_time) ?
+			read_rq : write_rq;
+		candidate->per_prio = &dd->per_prio[prio];
+		candidate->from_dispatch = false;
+		return true;
+	}
+
+	return false;
+}
+
+static void dd_consider_small_candidate(struct list_head *list,
+					 struct dd_per_prio *per_prio,
+					 bool from_dispatch,
+					 unsigned int *budget,
+					 struct dd_candidate *candidate,
+					 bool *found, unsigned int *smallest)
+{
+	struct request *rq;
+
+	list_for_each_entry(rq, list, queuelist) {
+		unsigned int bytes;
+
+		if (!*budget)
+			return;
+		(*budget)--;
+		if (smart_io_throttle_rq_class(rq) != SMART_IO_RQ_BACKGROUND)
+			continue;
+		bytes = blk_rq_bytes(rq);
+		if (*found && bytes >= *smallest)
+			continue;
+		*found = true;
+		*smallest = bytes;
+		candidate->rq = rq;
+		candidate->per_prio = per_prio;
+		candidate->from_dispatch = from_dispatch;
+	}
+}
+
+static bool dd_find_small_background(struct deadline_data *dd,
+				     struct dd_candidate *candidate)
+{
+	unsigned int budget = smart_io_throttle_scan_budget(&dd->throttle);
+	unsigned int smallest = 0;
+	bool found = false;
+	enum dd_prio prio;
+
+	for (prio = 0; prio <= DD_PRIO_MAX; prio++) {
+		dd_consider_small_candidate(&dd->per_prio[prio].dispatch,
+						    &dd->per_prio[prio], true,
+						    &budget, candidate, &found, &smallest);
+	}
+	for (prio = 0; prio <= DD_PRIO_MAX; prio++) {
+		dd_consider_small_candidate(&dd->per_prio[prio].fifo_list[DD_READ],
+						    &dd->per_prio[prio], false,
+						    &budget, candidate, &found, &smallest);
+		dd_consider_small_candidate(&dd->per_prio[prio].fifo_list[DD_WRITE],
+						    &dd->per_prio[prio], false,
+						    &budget, candidate, &found, &smallest);
+	}
+
+	return found;
+}
+
+static void dd_consider_expired_background(struct list_head *list,
+					    struct dd_per_prio *per_prio,
+					    bool from_dispatch,
+					    struct deadline_data *dd,
+					    u64 now_ns,
+					    unsigned int *budget,
+					    struct dd_candidate *candidate,
+					    bool *found,
+					    u64 *oldest_ts_ns)
+{
+	struct request *rq;
+
+	list_for_each_entry(rq, list, queuelist) {
+		u64 queued_ts_ns;
+
+		if (!*budget)
+			return;
+		(*budget)--;
+		if (!smart_io_throttle_background_deadline_expired(
+				&dd->throttle, rq, now_ns, &queued_ts_ns))
+			continue;
+		if (*found && queued_ts_ns >= *oldest_ts_ns)
+			continue;
+		*found = true;
+		*oldest_ts_ns = queued_ts_ns;
+		candidate->rq = rq;
+		candidate->per_prio = per_prio;
+		candidate->from_dispatch = from_dispatch;
+	}
+}
+
+static bool dd_find_expired_background(struct deadline_data *dd, u64 now_ns,
+				       struct dd_candidate *candidate)
+{
+	unsigned int budget = smart_io_throttle_scan_budget(&dd->throttle);
+	u64 oldest_ts_ns = 0;
+	bool found = false;
+	enum dd_prio prio;
+
+	if (!smart_io_throttle_deadline_escape_available(&dd->throttle))
+		return false;
+	for (prio = 0; prio <= DD_PRIO_MAX; prio++)
+		dd_consider_expired_background(&dd->per_prio[prio].dispatch,
+					       &dd->per_prio[prio], true, dd,
+					       now_ns, &budget, candidate,
+					       &found, &oldest_ts_ns);
+	for (prio = 0; prio <= DD_PRIO_MAX; prio++) {
+		dd_consider_expired_background(
+			&dd->per_prio[prio].fifo_list[DD_READ],
+			&dd->per_prio[prio], false, dd, now_ns, &budget,
+			candidate, &found, &oldest_ts_ns);
+		dd_consider_expired_background(
+			&dd->per_prio[prio].fifo_list[DD_WRITE],
+			&dd->per_prio[prio], false, dd, now_ns, &budget,
+			candidate, &found, &oldest_ts_ns);
+	}
+
+	return found;
+}
+
+static struct request *dd_dispatch_candidate(struct deadline_data *dd,
+					       struct dd_candidate *candidate)
+{
+	struct request *rq = candidate->rq;
+	struct dd_per_prio *per_prio = candidate->per_prio;
+	enum dd_data_dir data_dir = rq_data_dir(rq);
+
+	if (candidate->from_dispatch)
+		list_del_init(&rq->queuelist);
+	else
+		deadline_move_request(dd, per_prio, rq);
+	dd->last_dir = data_dir;
+	dd->batching = 1;
+	per_prio->latest_pos[data_dir] = blk_rq_pos(rq);
+	per_prio->stats.dispatched++;
+	rq->rq_flags |= RQF_STARTED;
+	return rq;
+}
+
+static struct request *dd_dispatch_class(struct deadline_data *dd,
+					 enum smart_io_rq_class class,
+					 bool require_seq)
+{
+	struct dd_candidate candidate;
+
+	if (!dd_find_class_candidate(dd, class, require_seq, &candidate))
+		return NULL;
+	return dd_dispatch_candidate(dd, &candidate);
+}
+
+static struct request *dd_dispatch_background_policy(
+		struct deadline_data *dd, enum smart_io_dispatch_policy policy,
+		enum smart_io_dispatch_selection *selection)
+{
+	struct dd_candidate candidate;
+
+	if (policy == SMART_IO_DISPATCH_SMALL &&
+	    dd_find_small_background(dd, &candidate)) {
+		*selection = SMART_IO_SELECTION_SMALL;
+		return dd_dispatch_candidate(dd, &candidate);
+	}
+	if (policy == SMART_IO_DISPATCH_SEQ) {
+		if (dd_find_class_candidate(dd, SMART_IO_RQ_BACKGROUND, true,
+					    &candidate)) {
+			*selection = SMART_IO_SELECTION_SEQ_HIT;
+			return dd_dispatch_candidate(dd, &candidate);
+		}
+		*selection = SMART_IO_SELECTION_SEQ_FALLBACK;
+	}
+	return NULL;
+}
+
 /*
  * Check whether there are any requests with priority other than DD_RT_PRIO
  * that were inserted more than prio_aging_expire jiffies ago.
  */
 static struct request *dd_dispatch_prio_aged_requests(struct deadline_data *dd,
-						      unsigned long now)
+						      unsigned long now,
+						      enum dd_prio first_prio)
 {
 	struct request *rq;
 	enum dd_prio prio;
@@ -435,12 +688,13 @@ static struct request *dd_dispatch_prio_aged_requests(struct deadline_data *dd,
 
 	lockdep_assert_held(&dd->lock);
 
-	prio_cnt = !!dd_queued(dd, DD_RT_PRIO) + !!dd_queued(dd, DD_BE_PRIO) +
-		   !!dd_queued(dd, DD_IDLE_PRIO);
+	prio_cnt = 0;
+	for (prio = first_prio; prio <= DD_PRIO_MAX; prio++)
+		prio_cnt += !!dd_queued(dd, prio);
 	if (prio_cnt < 2)
 		return NULL;
 
-	for (prio = DD_BE_PRIO; prio <= DD_PRIO_MAX; prio++) {
+	for (prio = first_prio; prio <= DD_PRIO_MAX; prio++) {
 		rq = __dd_dispatch_request(dd, &dd->per_prio[prio],
 					   now - dd->prio_aging_expire);
 		if (rq)
@@ -462,23 +716,75 @@ static struct request *dd_dispatch_request(struct blk_mq_hw_ctx *hctx)
 {
 	struct deadline_data *dd = hctx->queue->elevator->elevator_data;
 	const unsigned long now = jiffies;
-	struct request *rq;
+	struct dd_candidate deadline_candidate;
+	struct request *rq = NULL;
 	enum dd_prio prio;
+	enum smart_io_dispatch_policy policy;
+	enum smart_io_dispatch_selection selection =
+		SMART_IO_SELECTION_BACKGROUND_BASELINE;
+	bool controlled_work;
 
+	smart_io_throttle_dispatch_model_if_needed(&dd->throttle);
 	spin_lock(&dd->lock);
-	rq = dd_dispatch_prio_aged_requests(dd, now);
-	if (rq)
+	if (!smart_io_throttle_enabled()) {
+		rq = dd_dispatch_prio_aged_requests(dd, now, DD_RT_PRIO);
+		if (rq)
+			goto account;
+		for (prio = DD_RT_PRIO; prio <= DD_PRIO_MAX; prio++) {
+			rq = __dd_dispatch_request(dd, &dd->per_prio[prio], now);
+			if (rq || dd_queued(dd, prio))
+				break;
+		}
+		goto account;
+	}
+
+	rq = dd_dispatch_class(dd, SMART_IO_RQ_SPECIAL, false);
+	if (rq) {
+		selection = SMART_IO_SELECTION_SPECIAL;
+		goto account;
+	}
+
+	if (dd_find_expired_background(dd, ktime_get_boottime_ns(),
+				       &deadline_candidate)) {
+		rq = dd_dispatch_candidate(dd, &deadline_candidate);
+		selection = SMART_IO_SELECTION_BACKGROUND_DEADLINE;
+		goto account;
+	}
+
+	rq = dd_dispatch_class(dd, SMART_IO_RQ_FOREGROUND, false);
+	if (rq) {
+		selection = SMART_IO_SELECTION_FOREGROUND_FIFO;
+		goto account;
+	}
+
+	controlled_work = smart_io_throttle_has_pending(
+		&dd->throttle, SMART_IO_RQ_BACKGROUND);
+	if (!controlled_work ||
+	    !smart_io_throttle_background_allowed(&dd->throttle))
 		goto unlock;
+
+	policy = smart_io_throttle_effective_policy(&dd->throttle);
+	rq = dd_dispatch_background_policy(dd, policy, &selection);
+	if (rq)
+		goto account;
+
+	rq = dd_dispatch_prio_aged_requests(dd, now, DD_RT_PRIO);
+	if (rq)
+		goto account;
 
 	/*
 	 * Next, dispatch requests in priority order. Ignore lower priority
 	 * requests if any higher priority requests are pending.
 	 */
-	for (prio = 0; prio <= DD_PRIO_MAX; prio++) {
+	for (prio = DD_RT_PRIO; prio <= DD_PRIO_MAX; prio++) {
 		rq = __dd_dispatch_request(dd, &dd->per_prio[prio], now);
 		if (rq || dd_queued(dd, prio))
 			break;
 	}
+
+account:
+	if (rq)
+		smart_io_throttle_account_dispatch(&dd->throttle, rq, selection);
 
 unlock:
 	spin_unlock(&dd->lock);
@@ -543,6 +849,8 @@ static void dd_exit_sched(struct elevator_queue *e)
 	struct deadline_data *dd = e->elevator_data;
 	enum dd_prio prio;
 
+	smart_io_throttle_queue_exit(&dd->throttle);
+
 	for (prio = 0; prio <= DD_PRIO_MAX; prio++) {
 		struct dd_per_prio *per_prio = &dd->per_prio[prio];
 		const struct io_stats_per_prio *stats = &per_prio->stats;
@@ -587,6 +895,7 @@ static int dd_init_sched(struct request_queue *q, struct elevator_type *e)
 	for (prio = 0; prio <= DD_PRIO_MAX; prio++) {
 		struct dd_per_prio *per_prio = &dd->per_prio[prio];
 
+		per_prio->throttle = &dd->throttle;
 		INIT_LIST_HEAD(&per_prio->dispatch);
 		INIT_LIST_HEAD(&per_prio->fifo_list[DD_READ]);
 		INIT_LIST_HEAD(&per_prio->fifo_list[DD_WRITE]);
@@ -605,9 +914,14 @@ static int dd_init_sched(struct request_queue *q, struct elevator_type *e)
 	/* We dispatch from request queue wide instead of hw queue */
 	blk_queue_flag_set(QUEUE_FLAG_SQ_SCHED, q);
 
+	ret = smart_io_throttle_queue_init(&dd->throttle, q);
+	if (ret)
+		goto free_dd;
 	q->elevator = eq;
 	return 0;
 
+free_dd:
+	kfree(dd);
 put_eq:
 	kobject_put(&eq->kobj);
 	return ret;
@@ -691,6 +1005,7 @@ static void dd_insert_request(struct blk_mq_hw_ctx *hctx, struct request *rq,
 	if (blk_mq_sched_try_insert_merge(q, rq, free))
 		return;
 
+	smart_io_throttle_classify_request(&dd->throttle, rq);
 	trace_block_rq_insert(rq);
 
 	if (flags & BLK_MQ_INSERT_AT_HEAD) {
@@ -744,6 +1059,7 @@ static void dd_insert_requests(struct blk_mq_hw_ctx *hctx,
 static void dd_prepare_request(struct request *rq)
 {
 	rq->elv.priv[0] = NULL;
+	smart_io_throttle_prepare_request(rq);
 }
 
 /*
@@ -752,6 +1068,13 @@ static void dd_prepare_request(struct request *rq)
 static void dd_finish_request(struct request *rq)
 {
 	struct dd_per_prio *per_prio = rq->elv.priv[0];
+	struct smart_io_throttle_ctx *throttle = per_prio ?
+		per_prio->throttle : NULL;
+
+	if (!throttle && rq->q && rq->q->elevator)
+		throttle = &((struct deadline_data *)
+			rq->q->elevator->elevator_data)->throttle;
+	smart_io_throttle_finish_request(throttle, rq);
 
 	/*
 	 * The block layer core may call dd_finish_request() without having
@@ -760,25 +1083,32 @@ static void dd_finish_request(struct request *rq)
 	 */
 	if (per_prio)
 		atomic_inc(&per_prio->stats.completed);
-}
-
-static bool dd_has_work_for_prio(struct dd_per_prio *per_prio)
-{
-	return !list_empty_careful(&per_prio->dispatch) ||
-		!list_empty_careful(&per_prio->fifo_list[DD_READ]) ||
-		!list_empty_careful(&per_prio->fifo_list[DD_WRITE]);
+	rq->elv.priv[0] = NULL;
 }
 
 static bool dd_has_work(struct blk_mq_hw_ctx *hctx)
 {
 	struct deadline_data *dd = hctx->queue->elevator->elevator_data;
-	enum dd_prio prio;
 
-	for (prio = 0; prio <= DD_PRIO_MAX; prio++)
-		if (dd_has_work_for_prio(&dd->per_prio[prio]))
-			return true;
+	if (!smart_io_throttle_enabled()) {
+		enum dd_prio prio;
 
-	return false;
+		for (prio = 0; prio <= DD_PRIO_MAX; prio++)
+			if (dd_has_work_for_prio(&dd->per_prio[prio]))
+				return true;
+		return false;
+	}
+	if (smart_io_throttle_model_dispatch_needed(&dd->throttle))
+		return true;
+	if (smart_io_throttle_has_pending(&dd->throttle, SMART_IO_RQ_SPECIAL) ||
+	    smart_io_throttle_has_pending(&dd->throttle,
+					  SMART_IO_RQ_FOREGROUND))
+		return true;
+	if (!smart_io_throttle_has_pending(&dd->throttle,
+					   SMART_IO_RQ_BACKGROUND))
+		return false;
+
+	return smart_io_throttle_background_allowed(&dd->throttle);
 }
 
 /*
@@ -819,7 +1149,7 @@ static ssize_t __FUNC(struct elevator_queue *e, const char *page, size_t count)	
 	return count;							\
 }
 #define STORE_INT(__FUNC, __PTR, MIN, MAX)				\
-	STORE_FUNCTION(__FUNC, __PTR, MIN, MAX, )
+	STORE_FUNCTION(__FUNC, __PTR, MIN, MAX, (int))
 #define STORE_JIFFIES(__FUNC, __PTR, MIN, MAX)				\
 	STORE_FUNCTION(__FUNC, __PTR, MIN, MAX, msecs_to_jiffies)
 STORE_JIFFIES(deadline_read_expire_store, &dd->fifo_expire[DD_READ], 0, INT_MAX);
@@ -847,7 +1177,7 @@ static struct elv_fs_entry deadline_attrs[] = {
 	__ATTR_NULL
 };
 
-static struct elevator_type mq_deadline = {
+static struct elevator_type smart_deadline_elevator = {
 	.ops = {
 		.depth_updated		= dd_depth_updated,
 		.limit_depth		= dd_limit_depth,
@@ -873,6 +1203,20 @@ static struct elevator_type mq_deadline = {
 	.elevator_owner = THIS_MODULE,
 };
 MODULE_ALIAS("smart-deadline-iosched");
+
+bool smart_deadline_rq_is_foreground(const struct request *rq)
+{
+	struct elevator_queue *elevator;
+
+	if (!rq || !rq->q)
+		return false;
+
+	elevator = READ_ONCE(rq->q->elevator);
+	if (!elevator || READ_ONCE(elevator->type) != &smart_deadline_elevator)
+		return false;
+
+	return smart_io_throttle_rq_class(rq) == SMART_IO_RQ_FOREGROUND;
+}
 
 int smart_deadline_init(void)
 {

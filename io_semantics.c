@@ -28,6 +28,7 @@
 #include "smart_io_policy.h"
 #include "system_context.h"
 #include "trace_instance.h"
+#include "tp_pagecache_demo.h"
 #include "tool.h"
 
 #define NR_RQ_SHARDS 8
@@ -35,6 +36,7 @@
 #define REMAP_HASH_BITS 10
 #define HIST_BUCKETS 21
 #define HOT_INODE_MAX 64
+#define HOT_INODE_TTL_NS (500ULL * 1000ULL * 1000ULL)
 #define DEFAULT_QUEUE_DEPTH 128
 #define SMART_IO_TICK_MS 100U
 #define DEFAULT_BLK_MAX_BW_KBPS (800U * 1024U)
@@ -78,15 +80,10 @@ struct uid_io_bucket {
 	struct hlist_head hash[1 << SMART_IO_UID_HASH_BITS];
 };
 
-struct inode_count_entry {
-	u64 ino;
-	u64 count;
-	struct hlist_node node;
-};
-
-struct inode_bucket {
-	spinlock_t lock;
-	struct hlist_head hash[1 << SMART_IO_INO_HASH_BITS];
+struct hot_inode_entry {
+	u64 inode_hash;
+	u64 last_seen_ns;
+	u16 file_ext;
 };
 
 struct lat_hist {
@@ -150,22 +147,19 @@ static DEFINE_SPINLOCK(rq_remap_lock);
 static DEFINE_PER_CPU(struct uid_io_bucket, uid_io_curr);
 static struct hlist_head uid_io_prev[1 << SMART_IO_UID_HASH_BITS];
 static DEFINE_RWLOCK(uid_io_prev_lock);
-static DEFINE_PER_CPU(struct inode_bucket, inode_curr);
 static DEFINE_PER_CPU(struct percpu_bucket, cur_bucket);
 
 static struct kmem_cache *rq_record_cache;
 static struct kmem_cache *bio_remap_cache;
 static struct kmem_cache *rq_remap_cache;
 static struct kmem_cache *uid_io_cache;
-static struct kmem_cache *inode_cache;
 
 static struct completed_bucket last_bucket;
 static DEFINE_SPINLOCK(last_bucket_lock);
 static struct smart_io_event latest_event;
 static DEFINE_SPINLOCK(latest_event_lock);
 
-static u64 hot_inodes[HOT_INODE_MAX];
-static int hot_inode_count;
+static struct hot_inode_entry hot_inodes[HOT_INODE_MAX];
 static DEFINE_SPINLOCK(hot_inode_lock);
 
 static atomic_t in_flight = ATOMIC_INIT(0);
@@ -451,62 +445,102 @@ retry:
 	spin_unlock_irqrestore(&bucket->lock, flags);
 }
 
-static bool is_hot_inode(u64 inode_hash)
+static bool hot_inode_entry_expired(const struct hot_inode_entry *entry,
+					    u64 now_ns)
 {
-	unsigned long flags;
-	int i;
-	bool found = false;
-
-	if (!inode_hash)
-		return false;
-
-	spin_lock_irqsave(&hot_inode_lock, flags);
-	for (i = 0; i < hot_inode_count; i++) {
-		if (hot_inodes[i] == inode_hash) {
-			found = true;
-			break;
-		}
-	}
-	spin_unlock_irqrestore(&hot_inode_lock, flags);
-	return found;
+	return !entry->inode_hash ||
+		(now_ns >= entry->last_seen_ns &&
+		 now_ns - entry->last_seen_ns >= HOT_INODE_TTL_NS);
 }
 
-static void inode_curr_add(u64 inode_hash)
+static void smart_io_mark_hot_inode(u64 inode_hash, u16 file_ext)
 {
-	struct inode_bucket *bucket;
-	struct inode_count_entry *entry;
-	struct inode_count_entry *new_entry = NULL;
-	unsigned int idx = ino_hash_idx(inode_hash);
 	unsigned long flags;
+	u64 now_ns;
+	u64 oldest_ns = U64_MAX;
+	int oldest_idx = 0;
+	int expired_idx = -1;
+	int i;
 
-	if (!inode_hash)
+	if (!inode_hash ||
+	    (file_ext != SMART_IO_FILE_EXT_APK &&
+	     file_ext != SMART_IO_FILE_EXT_ODEX &&
+	     file_ext != SMART_IO_FILE_EXT_VDEX))
 		return;
 
-retry:
-	bucket = this_cpu_ptr(&inode_curr);
-	spin_lock_irqsave(&bucket->lock, flags);
-	hlist_for_each_entry(entry, &bucket->hash[idx], node) {
-		if (entry->ino == inode_hash) {
-			entry->count++;
-			spin_unlock_irqrestore(&bucket->lock, flags);
-			if (new_entry)
-				kmem_cache_free(inode_cache, new_entry);
+	now_ns = ktime_get_boottime_ns();
+	spin_lock_irqsave(&hot_inode_lock, flags);
+	for (i = 0; i < HOT_INODE_MAX; i++) {
+		struct hot_inode_entry *entry = &hot_inodes[i];
+
+		if (entry->inode_hash == inode_hash) {
+			entry->last_seen_ns = now_ns;
+			entry->file_ext = file_ext;
+			spin_unlock_irqrestore(&hot_inode_lock, flags);
 			return;
+		}
+		if (hot_inode_entry_expired(entry, now_ns)) {
+			if (expired_idx < 0)
+				expired_idx = i;
+			continue;
+		}
+		if (entry->last_seen_ns < oldest_ns) {
+			oldest_ns = entry->last_seen_ns;
+			oldest_idx = i;
 		}
 	}
 
-	if (!new_entry) {
-		spin_unlock_irqrestore(&bucket->lock, flags);
-		new_entry = kmem_cache_zalloc(inode_cache, GFP_ATOMIC);
-		if (!new_entry)
-			return;
-		new_entry->ino = inode_hash;
-		goto retry;
-	}
+	if (expired_idx < 0)
+		expired_idx = oldest_idx;
+	hot_inodes[expired_idx].inode_hash = inode_hash;
+	hot_inodes[expired_idx].last_seen_ns = now_ns;
+	hot_inodes[expired_idx].file_ext = file_ext;
+	spin_unlock_irqrestore(&hot_inode_lock, flags);
+}
 
-	new_entry->count = 1;
-	hlist_add_head(&new_entry->node, &bucket->hash[idx]);
-	spin_unlock_irqrestore(&bucket->lock, flags);
+u16 smart_io_hot_inode_ext(u64 inode_hash)
+{
+	unsigned long flags;
+	u64 now_ns;
+	u16 file_ext = SMART_IO_FILE_EXT_UNKNOWN;
+	int i;
+
+	if (!inode_hash)
+		return SMART_IO_FILE_EXT_UNKNOWN;
+
+	now_ns = ktime_get_boottime_ns();
+	spin_lock_irqsave(&hot_inode_lock, flags);
+	for (i = 0; i < HOT_INODE_MAX; i++) {
+		struct hot_inode_entry *entry = &hot_inodes[i];
+
+		if (entry->inode_hash != inode_hash)
+			continue;
+		if (!hot_inode_entry_expired(entry, now_ns))
+			file_ext = entry->file_ext;
+		else
+			memset(entry, 0, sizeof(*entry));
+		break;
+	}
+	spin_unlock_irqrestore(&hot_inode_lock, flags);
+	return file_ext;
+}
+
+bool smart_io_is_hot_inode(u64 inode_hash)
+{
+	return smart_io_hot_inode_ext(inode_hash) != SMART_IO_FILE_EXT_UNKNOWN;
+}
+
+static bool smart_io_is_hot_read_candidate(const struct smart_io_event *event)
+{
+	if (!event || event->io_op != SMART_IO_OP_READ || !event->inode_hash)
+		return false;
+	if (event->file_ext != SMART_IO_FILE_EXT_APK &&
+	    event->file_ext != SMART_IO_FILE_EXT_ODEX &&
+	    event->file_ext != SMART_IO_FILE_EXT_VDEX)
+		return false;
+
+	return event->is_front ||
+		IOPRIO_PRIO_CLASS(event->ioprio_class) == IOPRIO_CLASS_RT;
 }
 
 static u8 snapshot_device_util(void)
@@ -647,13 +681,13 @@ static void emit_raw_insert(const struct smart_io_event *evt,
 
 	smart_io_raw_emit("block_rq_insert: "
 			  "ts_insert=%llu uid=%u pid=%d tgid=%d rq_p=%p io_op=%u io_size=%u cmd=%u "
-			  "sector=%llu ioprio=%u file_ext=%u file_ext_s=%s "
+			  "sector=%llu ioprio=%u file_ext=%u file_ext_s=%s fg=%u thread_role=%u "
 			  "fs_type=%s dev_name=%s remap_from=%s remap_mixed=%u dev_type=%u is_sync=%u "
 			  "inode_hash=%llu folio_index=%llu io_inflight=%u queue_sat=%u "
 			  "nr_segment=%u tag=%d tag_depth_max=%u tag_depth_cur=%d\n",
 			  evt->ts_insert, evt->uid, current->pid, current->tgid, (void *)rq,
 			  evt->io_op, blk_rq_bytes(rq), rq->cmd_flags, evt->sector, evt->ioprio_class,
-			  evt->file_ext, evt->file_ext_str, evt->fs_type,
+			  evt->file_ext, evt->file_ext_str, evt->is_front, evt->thread_role, evt->fs_type,
 			  evt->dev_name, evt->remap_from, evt->remap_mixed,
 			  evt->device_type, evt->is_sync, evt->inode_hash,
 			  evt->folio_index, evt->io_in_flight, evt->queue_saturate,
@@ -672,14 +706,14 @@ static void emit_raw_issue(const struct smart_io_event *evt,
 	if (new_record) {
 		smart_io_raw_emit("block_rq_issue: "
 				  "ts_issue=%llu uid=%u pid=%d tgid=%d rq_p=%p io_op=%u io_size=%u cmd=%u "
-				  "sector=%llu ioprio=%u file_ext=%u file_ext_s=%s "
+				  "sector=%llu ioprio=%u file_ext=%u file_ext_s=%s fg=%u thread_role=%u "
 				  "fs_type=%s dev_name=%s remap_from=%s remap_mixed=%u dev_type=%u is_sync=%u "
 				  "inode_hash=%llu folio_index=%llu io_inflight=%u queue_sat=%u nr_bio=%u "
-				  "nr_segment=%u tag=%d tag_depth_max=%u tag_depth_cur=%d direct=1\n",
+				  "nr_segment=%u tag=%d tag_depth_max=%u tag_depth_cur=%d sched_lat_ns=0 direct=1\n",
 				  evt->ts_issue, evt->uid, current->pid, current->tgid,
 				  (void *)rq, evt->io_op, blk_rq_bytes(rq), rq->cmd_flags, evt->sector,
-				  evt->ioprio_class, evt->file_ext, evt->file_ext_str,
-				  evt->fs_type, evt->dev_name, evt->remap_from,
+				  evt->ioprio_class, evt->file_ext, evt->file_ext_str, evt->is_front,
+				  evt->thread_role, evt->fs_type, evt->dev_name, evt->remap_from,
 				  evt->remap_mixed, evt->device_type, evt->is_sync,
 				  evt->inode_hash, evt->folio_index, evt->io_in_flight,
 				  evt->queue_saturate, nr_bio, nr_segment, tag,
@@ -689,10 +723,10 @@ static void emit_raw_issue(const struct smart_io_event *evt,
 
 	smart_io_raw_emit("block_rq_issue: "
 			  "ts_issue=%llu uid=%u inode_hash=%llu rq_p=%p io_op=%u remap_from=%s remap_mixed=%u "
-			  "nr_bio=%u nr_segment=%u tag=%d tag_depth_max=%u tag_depth_cur=%d\n",
+			  "nr_bio=%u nr_segment=%u tag=%d tag_depth_max=%u tag_depth_cur=%d sched_lat_ns=%llu\n",
 			  evt->ts_issue, evt->uid, evt->inode_hash, (void *)rq,
 			  evt->io_op, evt->remap_from, evt->remap_mixed, nr_bio,
-			  nr_segment, tag, tag_depth_max, tag_depth_cur);
+			  nr_segment, tag, tag_depth_max, tag_depth_cur, evt->ts_issue - evt->ts_insert);
 }
 
 static void emit_raw_requeue(const struct smart_io_event *evt,
@@ -707,11 +741,11 @@ static void emit_raw_requeue(const struct smart_io_event *evt,
 	smart_io_raw_emit("block_rq_requeue: "
 			  "ts_requeue=%llu uid=%u inode_hash=%llu rq_p=%p io_op=%u io_size=%u cmd=%u "
 			  "remap_from=%s remap_mixed=%u nr_bio=%u nr_segment=%u tag=%d "
-			  "tag_depth_max=%u tag_depth_cur=%d\n",
+			  "tag_depth_max=%u tag_depth_cur=%d sched_lat_ns=%llu\n",
 			  ktime_get_boottime_ns(), evt->uid, evt->inode_hash,
 			  (void *)rq, evt->io_op, blk_rq_bytes(rq), rq->cmd_flags,
 			  evt->remap_from, evt->remap_mixed, nr_bio, nr_segment,
-			  tag, tag_depth_max, tag_depth_cur);
+			  tag, tag_depth_max, tag_depth_cur, evt->ts_requeue - evt->ts_insert);
 }
 
 static void emit_raw_complete(const struct smart_io_event *evt,
@@ -719,9 +753,9 @@ static void emit_raw_complete(const struct smart_io_event *evt,
 				       unsigned int nr_bytes)
 {
 	smart_io_raw_emit("block_rq_complete: "
-			  "ts_complete=%llu uid=%u inode_hash=%llu rq_p=%p io_op=%u nr_bytes=%u remap_from=%s remap_mixed=%u\n",
+			  "ts_complete=%llu uid=%u inode_hash=%llu rq_p=%p io_op=%u nr_bytes=%u remap_from=%s remap_mixed=%u sched_lat_ns=%llu dev_lat_ns=%llu\n",
 			  evt->ts_complete, evt->uid, evt->inode_hash, (void *)rq,
-			  evt->io_op, nr_bytes, evt->remap_from, evt->remap_mixed);
+			  evt->io_op, nr_bytes, evt->remap_from, evt->remap_mixed, evt->ts_issue - evt->ts_insert, evt->ts_complete - evt->ts_issue);
 }
 
 static void fill_record_from_current(struct rq_record *rec, struct request *rq,
@@ -753,12 +787,12 @@ static void fill_record_from_current(struct rq_record *rec, struct request *rq,
 	rec->data_bytes = blk_rq_bytes(rq);
 	evt->io_size_kb = blk_rq_bytes(rq) >> 10;
 	evt->sector = blk_rq_pos(rq);
-	evt->ioprio_class = rq->ioprio;
+	evt->ioprio_class = req_get_ioprio(rq);
 
 	extract_device_name(rq, evt->dev_name, sizeof(evt->dev_name));
 	apply_remap_info(evt, remap);
 	evt->device_type = lookup_device_type(evt->dev_name);
-	
+
 	if (bio) {
 		bool got_vfs_info;
 
@@ -800,7 +834,7 @@ static void fill_record_from_current(struct rq_record *rec, struct request *rq,
 	evt->cgroup_io_weight = get_cgroup_weight(rq);
 	evt->f2fs_gc_active = atomic_read(&f2fs_gc_active) ? 1 : 0;
 	evt->f2fs_cp_active = atomic_read(&f2fs_cp_active) ? 1 : 0;
-	evt->is_hot_file = is_hot_inode(evt->inode_hash) ? 1 : 0;
+	evt->is_hot_file = smart_io_is_hot_inode(evt->inode_hash) ? 1 : 0;
 	evt->mem_avail_mb = pages_to_mb(si_mem_available());
 	evt->dirty_pages_mb = pages_to_mb(global_node_page_state(NR_FILE_DIRTY));
 	evt->wb_pages_mb = pages_to_mb(global_node_page_state(NR_WRITEBACK));
@@ -933,10 +967,16 @@ void smart_io_record_insert(struct request *rq)
 
 	rec->rq = rq;
 	fill_record_from_current(rec, rq, false, &remap);
+	if (smart_io_is_hot_read_candidate(&rec->event))
+		smart_io_mark_hot_inode(rec->event.inode_hash,
+					rec->event.file_ext);
+	if (rec->event.io_op == SMART_IO_OP_READ)
+		smart_io_pagecache_demo_note_read(rec->event.uid,
+					  rec->event.inode_hash, rec->event.folio_index,
+					  rec->event.file_ext, rec->event.is_front);
 	if (!raw_mode_enabled()) {
 		uid_io_curr_add(rec->event.uid, rec->event.io_size_kb,
 				rec->event.io_op);
-		inode_curr_add(rec->event.inode_hash);
 	}
 
 	shard = &rq_shards[rq_shard_idx(rq)];
@@ -1003,10 +1043,18 @@ void smart_io_record_issue(struct request *rq)
 		rec->rq = rq;
 		fill_record_from_current(rec, rq, true, &remap);
 		rec->event.ts_issue = rec->event.ts_insert;
+		if (smart_io_is_hot_read_candidate(&rec->event))
+			smart_io_mark_hot_inode(rec->event.inode_hash,
+					rec->event.file_ext);
+		if (rec->event.io_op == SMART_IO_OP_READ)
+			smart_io_pagecache_demo_note_read(rec->event.uid,
+						  rec->event.inode_hash,
+						  rec->event.folio_index,
+						  rec->event.file_ext,
+						  rec->event.is_front);
 		if (!raw_mode_enabled()) {
 			uid_io_curr_add(rec->event.uid, rec->event.io_size_kb,
 					rec->event.io_op);
-			inode_curr_add(rec->event.inode_hash);
 		}
 		new_record = true;
 	}
@@ -1056,6 +1104,7 @@ void smart_io_record_requeue(struct request *rq)
 		spin_unlock_irqrestore(&shard->lock, flags);
 		return;
 	}
+	rec->event.ts_requeue = ktime_get_boottime_ns();
 	evt = rec->event;
 	spin_unlock_irqrestore(&shard->lock, flags);
 
@@ -1348,68 +1397,6 @@ static void uid_io_swap_buckets(void)
 	write_unlock_irqrestore(&uid_io_prev_lock, prev_flags);
 }
 
-static void hot_inode_consider(u64 ino, u64 count, u64 *top_ino, u64 *top_count)
-{
-	int i;
-	int min_idx = 0;
-
-	if (!ino || !count)
-		return;
-
-	for (i = 0; i < HOT_INODE_MAX; i++) {
-		if (!top_ino[i]) {
-			top_ino[i] = ino;
-			top_count[i] = count;
-			return;
-		}
-		if (top_ino[i] == ino) {
-			top_count[i] += count;
-			return;
-		}
-		if (top_count[i] < top_count[min_idx])
-			min_idx = i;
-	}
-
-	if (count > top_count[min_idx]) {
-		top_ino[min_idx] = ino;
-		top_count[min_idx] = count;
-	}
-}
-
-static void roll_hot_inodes(void)
-{
-	struct inode_bucket *bucket;
-	struct inode_count_entry *entry;
-	struct hlist_node *tmp;
-	u64 top_ino[HOT_INODE_MAX] = { 0 };
-	u64 top_count[HOT_INODE_MAX] = { 0 };
-	unsigned long flags;
-	int cpu;
-	int i;
-	int n = 0;
-
-	for_each_possible_cpu(cpu) {
-		bucket = per_cpu_ptr(&inode_curr, cpu);
-		spin_lock_irqsave(&bucket->lock, flags);
-		for (i = 0; i < ARRAY_SIZE(bucket->hash); i++) {
-			hlist_for_each_entry_safe(entry, tmp, &bucket->hash[i], node) {
-				hot_inode_consider(entry->ino, entry->count, top_ino, top_count);
-				hlist_del(&entry->node);
-				kmem_cache_free(inode_cache, entry);
-			}
-		}
-		spin_unlock_irqrestore(&bucket->lock, flags);
-	}
-
-	spin_lock_irqsave(&hot_inode_lock, flags);
-	for (i = 0; i < HOT_INODE_MAX; i++) {
-		if (top_ino[i])
-			hot_inodes[n++] = top_ino[i];
-	}
-	hot_inode_count = n;
-	spin_unlock_irqrestore(&hot_inode_lock, flags);
-}
-
 static void roll_completed_bucket(void)
 {
 	struct percpu_bucket *bucket;
@@ -1533,15 +1520,13 @@ static void roll_completed_bucket(void)
 
 void smart_io_periodic_tick(void)
 {
-	if (raw_mode_enabled()) {
+	if (raw_mode_enabled())
 		return;
-	}
 
 	uid_io_swap_buckets();
 	// if (++tick_count >= ROLL_TICKS) {
 	// 	tick_count = 0;
 	roll_completed_bucket();
-	roll_hot_inodes();
 	// }
 }
 
@@ -1665,32 +1650,9 @@ static void cleanup_uid_entries(void)
 	}
 }
 
-static void cleanup_inode_entries(void)
-{
-	struct inode_bucket *bucket;
-	struct inode_count_entry *entry;
-	struct hlist_node *tmp;
-	unsigned long flags;
-	int cpu;
-	int i;
-
-	for_each_possible_cpu(cpu) {
-		bucket = per_cpu_ptr(&inode_curr, cpu);
-		spin_lock_irqsave(&bucket->lock, flags);
-		for (i = 0; i < ARRAY_SIZE(bucket->hash); i++) {
-			hlist_for_each_entry_safe(entry, tmp, &bucket->hash[i], node) {
-				hlist_del(&entry->node);
-				kmem_cache_free(inode_cache, entry);
-			}
-		}
-		spin_unlock_irqrestore(&bucket->lock, flags);
-	}
-}
-
 int smart_io_semantics_init(void)
 {
 	struct uid_io_bucket *uid_bucket;
-	struct inode_bucket *ino_bucket;
 	struct percpu_bucket *bucket;
 	int cpu;
 	int i;
@@ -1715,12 +1677,6 @@ int smart_io_semantics_init(void)
 		smart_io_log_err("failed to allocate uid_io_cache\n");
 		goto err_uid_cache;
 	}
-	inode_cache = KMEM_CACHE(inode_count_entry, SLAB_HWCACHE_ALIGN);
-	if (!inode_cache) {
-		smart_io_log_err("failed to allocate inode_cache\n");
-		goto err_inode;
-	}
-
 	hash_init(bio_remap_hash);
 	hash_init(rq_remap_hash);
 	for (i = 0; i < NR_RQ_SHARDS; i++) {
@@ -1735,11 +1691,6 @@ int smart_io_semantics_init(void)
 		spin_lock_init(&uid_bucket->lock);
 		for (i = 0; i < ARRAY_SIZE(uid_bucket->hash); i++)
 			INIT_HLIST_HEAD(&uid_bucket->hash[i]);
-
-		ino_bucket = per_cpu_ptr(&inode_curr, cpu);
-		spin_lock_init(&ino_bucket->lock);
-		for (i = 0; i < ARRAY_SIZE(ino_bucket->hash); i++)
-			INIT_HLIST_HEAD(&ino_bucket->hash[i]);
 
 		bucket = per_cpu_ptr(&cur_bucket, cpu);
 		spin_lock_init(&bucket->lock);
@@ -1766,9 +1717,6 @@ int smart_io_semantics_init(void)
 			  NR_RQ_SHARDS, blk_max_bw_kbps);
 	return 0;
 
-err_inode:
-	kmem_cache_destroy(uid_io_cache);
-	uid_io_cache = NULL;
 err_uid_cache:
 	kmem_cache_destroy(rq_remap_cache);
 	rq_remap_cache = NULL;
@@ -1786,14 +1734,11 @@ void smart_io_semantics_exit(void)
 	smart_io_clear_remap_state();
 	cleanup_rq_records();
 	cleanup_uid_entries();
-	cleanup_inode_entries();
 
-	kmem_cache_destroy(inode_cache);
 	kmem_cache_destroy(uid_io_cache);
 	kmem_cache_destroy(rq_remap_cache);
 	kmem_cache_destroy(bio_remap_cache);
 	kmem_cache_destroy(rq_record_cache);
-	inode_cache = NULL;
 	uid_io_cache = NULL;
 	rq_remap_cache = NULL;
 	bio_remap_cache = NULL;

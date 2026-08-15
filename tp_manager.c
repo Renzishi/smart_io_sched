@@ -4,6 +4,7 @@
 #include "tp_binder.h"
 #include "tp_f2fs.h"
 #include "tp_filemap.h"
+#include "tp_pagecache_demo.h"
 #include "tp_psi.h"
 #include "tp_sched.h"
 
@@ -36,23 +37,27 @@ int smart_io_tp_init(void)
 	}
 
 	ret = register_filemap_tracepoints();
-	if (ret) {
-		unregister_f2fs_tracepoints();
-		unregister_block_tracepoints();
-		unregister_psi_tracepoints();
-		smart_io_log_err("filemap tracepoints unavailable: %d\n", ret);
-		return ret;
-	}
+	if (ret)
+		smart_io_log_warn("filemap tracepoints unavailable: %d\n", ret);
 
-	ret = register_binder_tracepoints();
+	ret = register_pagecache_demo();
 	if (ret) {
 		unregister_filemap_tracepoints();
 		unregister_psi_tracepoints();
 		unregister_f2fs_tracepoints();
 		unregister_block_tracepoints();
-		smart_io_log_err("failed to register binder tracepoints: %d\n", ret);
 		return ret;
 	}
+
+	// ret = register_binder_tracepoints();
+	// if (ret) {
+	// 	unregister_filemap_tracepoints();
+	// 	unregister_psi_tracepoints();
+	// 	unregister_f2fs_tracepoints();
+	// 	unregister_block_tracepoints();
+	// 	smart_io_log_err("failed to register binder tracepoints: %d\n", ret);
+	// 	return ret;
+	// }
 
 	// ret = register_sched_tracepoints();
 	// if (ret) {
@@ -72,7 +77,8 @@ int smart_io_tp_init(void)
 void smart_io_tp_exit(void)
 {
 	// unregister_sched_tracepoints();
-	unregister_binder_tracepoints();
+	// unregister_binder_tracepoints();
+	unregister_pagecache_demo();
 	unregister_filemap_tracepoints();
 	unregister_psi_tracepoints();
 	unregister_f2fs_tracepoints();

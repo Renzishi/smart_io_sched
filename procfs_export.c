@@ -1,5 +1,6 @@
 #include <linux/proc_fs.h>
 #include <linux/seq_file.h>
+#include <linux/string.h>
 #include <linux/uaccess.h>
 
 #include "filter.h"
@@ -7,8 +8,10 @@
 #include "procfs_export.h"
 #include "smart_io_log.h"
 #include "smart_io_policy.h"
+#include "smart_io_throttle.h"
 #include "smart_io_types.h"
 #include "system_context.h"
+#include "tp_pagecache_demo.h"
 #include "trace_instance.h"
 
 #define PROC_DIR "smart_io_sched"
@@ -179,6 +182,312 @@ static int fg_main_pid_open(struct inode *i, struct file *f)
 	return single_open(f, fg_main_pid_show, NULL);
 }
 
+static ssize_t throttle_enable_write(struct file *f, const char __user *ub,
+				     size_t c, loff_t *p)
+{
+	int enabled;
+	int ret;
+
+	ret = proc_parse_int(ub, c, &enabled);
+	if (ret)
+		return ret;
+	if (enabled != 0 && enabled != 1)
+		return -EINVAL;
+
+	ret = smart_io_throttle_set_enabled(enabled != 0);
+	if (ret) {
+		smart_io_log_warn("throttle enable rejected: enabled=%d ret=%d\n",
+				  enabled, ret);
+		return ret;
+	}
+
+	return c;
+}
+
+static int throttle_enable_show(struct seq_file *m, void *v)
+{
+	seq_printf(m, "%d\n", smart_io_throttle_get_enabled());
+	return 0;
+}
+
+static int throttle_enable_open(struct inode *i, struct file *f)
+{
+	return single_open(f, throttle_enable_show, NULL);
+}
+
+static ssize_t queue_rq_throttle_demo_write(struct file *f,
+					     const char __user *ub, size_t c,
+					     loff_t *p)
+{
+	int enabled;
+	int ret;
+
+	ret = proc_parse_int(ub, c, &enabled);
+	if (ret)
+		return ret;
+	if (enabled != 0 && enabled != 1)
+		return -EINVAL;
+
+	ret = smart_io_throttle_set_queue_rq_demo(enabled != 0);
+	if (ret)
+		return ret;
+
+	return c;
+}
+
+static int queue_rq_throttle_demo_show(struct seq_file *m, void *v)
+{
+	seq_printf(m, "%d\n", smart_io_throttle_get_queue_rq_demo());
+	return 0;
+}
+
+static int queue_rq_throttle_demo_open(struct inode *i, struct file *f)
+{
+	return single_open(f, queue_rq_throttle_demo_show, NULL);
+}
+
+static ssize_t throttle_ratios_write(struct file *f, const char __user *ub,
+				     size_t c, loff_t *p)
+{
+	char buf[32];
+	u32 light_pct;
+	u32 medium_pct;
+	u32 heavy_pct;
+	int ret;
+
+	if (c > sizeof(buf) - 1)
+		return -E2BIG;
+	if (copy_from_user(buf, ub, c))
+		return -EFAULT;
+	buf[c] = 0;
+	if (sscanf(strstrip(buf), "%u %u %u", &light_pct, &medium_pct,
+		   &heavy_pct) != 3)
+		return -EINVAL;
+
+	ret = smart_io_throttle_set_ratios(light_pct, medium_pct, heavy_pct);
+	return ret ? ret : c;
+}
+
+static int throttle_ratios_show(struct seq_file *m, void *v)
+{
+	u32 light_pct;
+	u32 medium_pct;
+	u32 heavy_pct;
+
+	smart_io_throttle_get_ratios(&light_pct, &medium_pct, &heavy_pct);
+	seq_printf(m, "%u %u %u\n", light_pct, medium_pct, heavy_pct);
+	return 0;
+}
+
+static int throttle_ratios_open(struct inode *i, struct file *f)
+{
+	return single_open(f, throttle_ratios_show, NULL);
+}
+
+static const struct proc_ops throttle_ratios_ops = {
+	.proc_open = throttle_ratios_open,
+	.proc_read = seq_read,
+	.proc_write = throttle_ratios_write,
+	.proc_lseek = seq_lseek,
+	.proc_release = single_release,
+};
+
+static ssize_t action_source_write(struct file *f, const char __user *ub,
+				   size_t c, loff_t *p)
+{
+	char buf[16];
+	enum smart_io_action_source source;
+	int ret;
+
+	if (c > sizeof(buf) - 1)
+		return -E2BIG;
+	if (copy_from_user(buf, ub, c))
+		return -EFAULT;
+	buf[c] = 0;
+	if (!strcmp(strstrip(buf), "fixed"))
+		source = SMART_IO_ACTION_SOURCE_FIXED;
+	else if (!strcmp(strstrip(buf), "model"))
+		source = SMART_IO_ACTION_SOURCE_MODEL;
+	else if (!strcmp(strstrip(buf), "monotonic"))
+		source = SMART_IO_ACTION_SOURCE_MONOTONIC;
+	else
+		return -EINVAL;
+
+	ret = smart_io_throttle_set_action_source(source);
+	return ret ? ret : c;
+}
+
+static int action_source_show(struct seq_file *m, void *v)
+{
+	seq_printf(m, "%s\n", smart_io_action_source_name(
+			   smart_io_throttle_get_action_source()));
+	return 0;
+}
+
+static int action_source_open(struct inode *i, struct file *f)
+{
+	return single_open(f, action_source_show, NULL);
+}
+
+static const struct proc_ops action_source_ops = {
+	.proc_open = action_source_open,
+	.proc_read = seq_read,
+	.proc_write = action_source_write,
+	.proc_lseek = seq_lseek,
+	.proc_release = single_release,
+};
+
+static int fixed_action_parse_level(const char *name,
+				    enum smart_io_throttle_level *level)
+{
+	if (!strcmp(name, "NO"))
+		*level = SMART_IO_THROTTLE_NO;
+	else if (!strcmp(name, "LIGHT"))
+		*level = SMART_IO_THROTTLE_LIGHT;
+	else if (!strcmp(name, "MEDIUM"))
+		*level = SMART_IO_THROTTLE_MEDIUM;
+	else if (!strcmp(name, "HEAVY"))
+		*level = SMART_IO_THROTTLE_HEAVY;
+	else
+		return -EINVAL;
+	return 0;
+}
+
+static int fixed_action_parse_policy(const char *name,
+				     enum smart_io_dispatch_policy *policy)
+{
+	if (!strcmp(name, "BASELINE"))
+		*policy = SMART_IO_DISPATCH_BASELINE;
+	else if (!strcmp(name, "SEQ"))
+		*policy = SMART_IO_DISPATCH_SEQ;
+	else if (!strcmp(name, "SMALL"))
+		*policy = SMART_IO_DISPATCH_SMALL;
+	else
+		return -EINVAL;
+	return 0;
+}
+
+static ssize_t fixed_action_write(struct file *f, const char __user *ub,
+				  size_t c, loff_t *p)
+{
+	char buf[32];
+	char level_name[8];
+	char policy_name[12];
+	enum smart_io_throttle_level level;
+	enum smart_io_dispatch_policy policy;
+	int ret;
+
+	if (c > sizeof(buf) - 1)
+		return -E2BIG;
+	if (copy_from_user(buf, ub, c))
+		return -EFAULT;
+	buf[c] = 0;
+	if (sscanf(strstrip(buf), "%7s %11s", level_name, policy_name) != 2)
+		return -EINVAL;
+	ret = fixed_action_parse_level(level_name, &level);
+	if (ret)
+		return ret;
+	ret = fixed_action_parse_policy(policy_name, &policy);
+	if (ret)
+		return ret;
+
+	ret = smart_io_throttle_set_fixed_action(level, policy);
+	return ret ? ret : c;
+}
+
+static int fixed_action_show(struct seq_file *m, void *v)
+{
+	enum smart_io_throttle_level level;
+	enum smart_io_dispatch_policy policy;
+
+	smart_io_throttle_get_fixed_action(&level, &policy);
+	seq_printf(m, "%s %s\n", smart_io_throttle_level_name(level),
+		   smart_io_dispatch_policy_name(policy));
+	return 0;
+}
+
+static int fixed_action_open(struct inode *i, struct file *f)
+{
+	return single_open(f, fixed_action_show, NULL);
+}
+
+static const struct proc_ops fixed_action_ops = {
+	.proc_open = fixed_action_open,
+	.proc_read = seq_read,
+	.proc_write = fixed_action_write,
+	.proc_lseek = seq_lseek,
+	.proc_release = single_release,
+};
+
+static ssize_t dev_lat_write(struct file *f, const char __user *ub, size_t c,
+			     loff_t *p)
+{
+	u32 threshold_us;
+	int ret;
+
+	ret = proc_parse_u32(ub, c, &threshold_us);
+	if (ret)
+		return ret;
+
+	ret = smart_io_throttle_set_dev_lat_threshold(threshold_us);
+	if (ret)
+		return ret;
+
+	return c;
+}
+
+static int dev_lat_show(struct seq_file *m, void *v)
+{
+	seq_printf(m, "%u\n", smart_io_throttle_get_dev_lat_threshold());
+	return 0;
+}
+
+static int dev_lat_open(struct inode *i, struct file *f)
+{
+	return single_open(f, dev_lat_show, NULL);
+}
+
+static const struct proc_ops dev_lat_ops = {
+	.proc_open = dev_lat_open,
+	.proc_read = seq_read,
+	.proc_write = dev_lat_write,
+	.proc_lseek = seq_lseek,
+	.proc_release = single_release,
+};
+
+static ssize_t background_deadline_write(struct file *f,
+					 const char __user *ub, size_t c,
+					 loff_t *p)
+{
+	u32 deadline_ms;
+	int ret;
+
+	ret = proc_parse_u32(ub, c, &deadline_ms);
+	if (ret)
+		return ret;
+	ret = smart_io_throttle_set_background_deadline_ms(deadline_ms);
+	return ret ? ret : c;
+}
+
+static int background_deadline_show(struct seq_file *m, void *v)
+{
+	seq_printf(m, "%u\n", smart_io_throttle_get_background_deadline_ms());
+	return 0;
+}
+
+static int background_deadline_open(struct inode *i, struct file *f)
+{
+	return single_open(f, background_deadline_show, NULL);
+}
+
+static const struct proc_ops background_deadline_ops = {
+	.proc_open = background_deadline_open,
+	.proc_read = seq_read,
+	.proc_write = background_deadline_write,
+	.proc_lseek = seq_lseek,
+	.proc_release = single_release,
+};
+
 static ssize_t scene_tag_write(struct file *f, const char __user *ub, size_t c,
 			       loff_t *p)
 {
@@ -268,6 +577,7 @@ static int jank_open(struct inode *i, struct file *f)
 
 static int stats_show(struct seq_file *m, void *v)
 {
+	struct smart_io_throttle_stats throttle_stats;
 	u32 ins;
 	u32 iss;
 	u32 cmp;
@@ -277,12 +587,53 @@ static int stats_show(struct seq_file *m, void *v)
 
 	if (!atomic_read(&smart_io_enabled)) {
 		seq_puts(m, "disabled\n");
-		return 0;
+	} else {
+		smart_io_get_io_stats(&ins, &iss, &cmp, &wait, &flight,
+				      &lost_cmp);
+		seq_printf(m, "insert:%u issue:%u complete:%u waiting:%u in_flight:%u lost_complete:%u\n",
+			   ins, iss, cmp, wait, flight, lost_cmp);
 	}
 
-	smart_io_get_io_stats(&ins, &iss, &cmp, &wait, &flight, &lost_cmp);
-	seq_printf(m, "insert:%u issue:%u complete:%u waiting:%u in_flight:%u lost_complete:%u\n",
-		   ins, iss, cmp, wait, flight, lost_cmp);
+	smart_io_throttle_get_stats(&throttle_stats);
+	seq_printf(m,
+		   "io_throttle enabled:%u active:%u inference_pending:%u action_valid:%u source:%s session_id:%llu control_id:%llu decision_id:%llu level:%s policy:%s ratios:%u/%u/%u resolved_ratio:%u queue_max:%u target_depth:%u current_depth:%u reserved_depth:%u issued_depth:%u metadata:capacity=%u,inuse=%u pending:special=%u,fg=%u,bg=%u gate:%s feedback:%s feedback_rq_id:%llu feedback_votes:count=%u,fast=%u,slow=%u threshold_us:%u background_deadline_ms:%u deadline_forced_active:%u\n",
+		   throttle_stats.enabled ? 1U : 0U,
+		   throttle_stats.active ? 1U : 0U,
+		   throttle_stats.inference_pending ? 1U : 0U,
+		   throttle_stats.action_valid ? 1U : 0U,
+		   smart_io_action_source_name(throttle_stats.action_source),
+		   throttle_stats.session_id, throttle_stats.control_id,
+		   throttle_stats.decision_id,
+		   smart_io_throttle_level_name(throttle_stats.level),
+		   smart_io_dispatch_policy_name(throttle_stats.policy),
+		   throttle_stats.light_pct, throttle_stats.medium_pct,
+		   throttle_stats.heavy_pct, throttle_stats.resolved_ratio_pct,
+		   throttle_stats.queue_max, throttle_stats.target_depth,
+			 throttle_stats.current_depth, throttle_stats.current_depth,
+			 throttle_stats.issued_depth, throttle_stats.meta_capacity,
+		   throttle_stats.meta_inuse, throttle_stats.special_pending,
+		   throttle_stats.fg_pending, throttle_stats.bg_pending,
+		   smart_io_gate_reason_name(throttle_stats.gate_reason),
+		   smart_io_feedback_state_name(throttle_stats.feedback_state),
+		   throttle_stats.feedback_rq_id,
+		   throttle_stats.feedback_vote_count,
+		   throttle_stats.feedback_fast_votes,
+		   throttle_stats.feedback_slow_votes,
+		   throttle_stats.dev_lat_threshold_us,
+		   throttle_stats.background_deadline_ms,
+		   throttle_stats.deadline_forced_active ? 1U : 0U);
+	seq_printf(m,
+		   "io_throttle_counts queues:%u inference:%llu timeout:%llu invalid:%llu dispatched:special=%llu,fg=%llu,bg=%llu bg_blocked:%llu bg_deadline_forced:%llu selection:baseline=%llu,seq=%llu,seq_fallback=%llu,small=%llu depth_anomalies:%llu feedback_rebind:%llu allocation_failures:%llu\n",
+		   throttle_stats.active_queues, throttle_stats.inference_count,
+		   throttle_stats.timeout_count, throttle_stats.invalid_result_count,
+		   throttle_stats.special_dispatched, throttle_stats.fg_dispatched,
+		   throttle_stats.bg_dispatched, throttle_stats.bg_blocked,
+		   throttle_stats.bg_deadline_forced,
+		   throttle_stats.baseline_hits, throttle_stats.seq_hits,
+		   throttle_stats.seq_fallbacks, throttle_stats.small_hits,
+		   throttle_stats.depth_anomalies,
+		   throttle_stats.feedback_rebind_count,
+		   throttle_stats.allocation_failures);
 	return 0;
 }
 
@@ -417,6 +768,36 @@ static int rawdata_trace_open(struct inode *i, struct file *f)
 	return single_open(f, rawdata_trace_show, NULL);
 }
 
+static ssize_t pagecache_demo_write(struct file *f, const char __user *ub,
+					    size_t c, loff_t *p)
+{
+	char buf[8];
+	int val;
+
+	if (c > sizeof(buf) - 1)
+		return -EINVAL;
+	if (copy_from_user(buf, ub, c))
+		return -EFAULT;
+	buf[c] = 0;
+	if (kstrtoint(strstrip(buf), 10, &val))
+		return -EINVAL;
+
+	smart_io_pagecache_demo_set_enabled(val != 0);
+	smart_io_log_info("pagecache demo %s.\n", val ? "enabled" : "disabled");
+	return c;
+}
+
+static int pagecache_demo_show(struct seq_file *m, void *v)
+{
+	seq_printf(m, "%d\n", smart_io_pagecache_demo_enabled() ? 1 : 0);
+	return 0;
+}
+
+static int pagecache_demo_open(struct inode *i, struct file *f)
+{
+	return single_open(f, pagecache_demo_show, NULL);
+}
+
 static ssize_t debug_write(struct file *f, const char __user *ub, size_t c,
 			  loff_t *p)
 {
@@ -500,6 +881,60 @@ struct proc_node proc_nodes[] = {
 			.proc_release = single_release,
 		},
 		.mode = 0666,
+		.exist = false,
+	},
+	{
+		.name = "throttle_enable",
+		.ops = &(struct proc_ops){
+			.proc_open = throttle_enable_open,
+			.proc_read = seq_read,
+			.proc_write = throttle_enable_write,
+			.proc_lseek = seq_lseek,
+			.proc_release = single_release,
+		},
+		.mode = 0644,
+		.exist = false,
+	},
+	{
+		.name = "queue_rq_throttle_demo",
+		.ops = &(struct proc_ops){
+			.proc_open = queue_rq_throttle_demo_open,
+			.proc_read = seq_read,
+			.proc_write = queue_rq_throttle_demo_write,
+			.proc_lseek = seq_lseek,
+			.proc_release = single_release,
+		},
+		.mode = 0644,
+		.exist = false,
+	},
+	{
+		.name = "throttle_ratios",
+		.ops = &throttle_ratios_ops,
+		.mode = 0644,
+		.exist = false,
+	},
+	{
+		.name = "action_source",
+		.ops = &action_source_ops,
+		.mode = 0644,
+		.exist = false,
+	},
+	{
+		.name = "fixed_action",
+		.ops = &fixed_action_ops,
+		.mode = 0644,
+		.exist = false,
+	},
+	{
+		.name = "dev_lat",
+		.ops = &dev_lat_ops,
+		.mode = 0644,
+		.exist = false,
+	},
+	{
+		.name = "background_deadline_ms",
+		.ops = &background_deadline_ops,
+		.mode = 0644,
 		.exist = false,
 	},
 	{
@@ -588,6 +1023,18 @@ struct proc_node proc_nodes[] = {
 			.proc_release = single_release,
 		},
 		.mode = 0200,
+		.exist = false,
+	},
+	{
+		.name = "pagecache_demo",
+		.ops = &(struct proc_ops){
+			.proc_open = pagecache_demo_open,
+			.proc_read = seq_read,
+			.proc_write = pagecache_demo_write,
+			.proc_lseek = seq_lseek,
+			.proc_release = single_release,
+		},
+		.mode = 0666,
 		.exist = false,
 	},
 };

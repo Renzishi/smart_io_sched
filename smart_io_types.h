@@ -9,6 +9,17 @@
 #define SMART_IO_FS_TYPE_LEN 16
 #define SMART_IO_DEV_NAME_LEN 32
 
+enum smart_io_file_ext {
+	SMART_IO_FILE_EXT_UNKNOWN = 0,
+	SMART_IO_FILE_EXT_DB = 1,
+	SMART_IO_FILE_EXT_SO = 2,
+	SMART_IO_FILE_EXT_DEX = 3,
+	SMART_IO_FILE_EXT_APK = 4,
+	SMART_IO_FILE_EXT_LOG = 5,
+	SMART_IO_FILE_EXT_VDEX = 6,
+	SMART_IO_FILE_EXT_ODEX = 7,
+};
+
 enum smart_io_thread_role {
 	ROLE_UNKNOWN = 0,
 	ROLE_UX = 1,
@@ -50,6 +61,7 @@ enum smart_io_task_state {
 struct smart_io_event {
 	u64 ts_insert;
 	u64 ts_issue;
+	u64 ts_requeue;
 	u64 ts_complete;
 
 	u32 uid;
@@ -60,7 +72,7 @@ struct smart_io_event {
 	u8 io_op;
 	u32 io_size_kb;
 	u64 sector;
-	u8 ioprio_class;
+	u16 ioprio_class;
 	u16 file_ext;
 	char file_ext_str[SMART_IO_FILE_EXT_STR_LEN];
 	char fs_type[SMART_IO_FS_TYPE_LEN];

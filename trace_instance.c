@@ -149,13 +149,17 @@ void smart_io_trace_debug(const char *fmt, ...)
 	struct va_format vaf;
 	va_list args;
 
-	if (atomic_read(&debug_enabled) == 0) {
+	if (atomic_read(&debug_enabled) == 0 || !fmt) {
 		return;
 	}
 
-	smart_io_log_warn("%s\n", fmt);
+	va_start(args, fmt);
+	vaf.fmt = fmt;
+	vaf.va = &args;
+	smart_io_log_warn("%pV", &vaf);
+	va_end(args);
 
-	if (unlikely(!tr || !fmt))
+	if (unlikely(!tr))
 		return;
 
 	va_start(args, fmt);
