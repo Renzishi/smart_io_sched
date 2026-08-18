@@ -3,6 +3,7 @@
 #define SMART_IO_THROTTLE_H
 
 #include <linux/blk-mq.h>
+#include <linux/completion.h>
 #include <linux/hashtable.h>
 #include <linux/hrtimer.h>
 #include <linux/list.h>
@@ -12,15 +13,20 @@
 
 #define SMART_IO_DEV_LAT_WINDOW 5
 #define SMART_IO_DEV_LAT_WINDOW_MAX_US 10000U
-#define SMART_IO_FEEDBACK_SAMPLE_MAX 3
-#define SMART_IO_FEEDBACK_VOTES_REQUIRED 2
+#define SMART_IO_FEEDBACK_SAMPLE_MAX 5
 #define SMART_IO_ACTIVE_HASH_BITS 6
 #define SMART_IO_INFLIGHT_HASH_BITS 6
 
 enum smart_io_rq_class {
-	SMART_IO_RQ_SPECIAL,
 	SMART_IO_RQ_FOREGROUND,
 	SMART_IO_RQ_BACKGROUND,
+};
+
+enum smart_io_queue_class {
+	SMART_IO_QUEUE_HP,
+	SMART_IO_QUEUE_RT,
+	SMART_IO_QUEUE_BE,
+	SMART_IO_QUEUE_COUNT,
 };
 
 enum smart_io_throttle_level {
@@ -41,7 +47,7 @@ enum smart_io_dispatch_policy {
 enum smart_io_action_source {
 	SMART_IO_ACTION_SOURCE_FIXED,
 	SMART_IO_ACTION_SOURCE_MODEL,
-	SMART_IO_ACTION_SOURCE_MONOTONIC,
+	SMART_IO_ACTION_SOURCE_COUNT,
 };
 
 enum smart_io_feedback_state {
@@ -58,7 +64,6 @@ enum smart_io_gate_reason {
 };
 
 enum smart_io_dispatch_selection {
-	SMART_IO_SELECTION_SPECIAL,
 	SMART_IO_SELECTION_FOREGROUND_FIFO,
 	SMART_IO_SELECTION_SEQ_HIT,
 	SMART_IO_SELECTION_SEQ_FALLBACK,
@@ -109,6 +114,7 @@ struct smart_io_rq_meta {
 	struct hlist_node inflight_start_node;
 	struct request *rq;
 	enum smart_io_rq_class class;
+	enum smart_io_queue_class queue_class;
 	enum req_op op;
 	sector_t start_sector;
 	sector_t end_sector;
@@ -119,6 +125,7 @@ struct smart_io_rq_meta {
 	u64 queued_ts_ns;
 	bool queued;
 	bool depth_accounted; /* current_depth reservation */
+	bool bg_depth_accounted; /* bg_current_depth reservation */
 	bool issued_accounted; /* issued_depth in-flight */
 	bool inflight_indexed;
 	bool feedback_bound;
@@ -149,8 +156,8 @@ struct smart_io_throttle_ctx {
 	enum smart_io_feedback_state feedback_state;
 
 	u32 current_depth; /* dispatch to requeue/final complete */
+	u32 bg_current_depth; /* background dispatch to final complete */
 	u32 issued_depth; /* issue to requeue/final complete */
-	u32 pending_special;
 	u32 pending_fg;
 	u32 pending_bg;
 	struct smart_io_completion_sample dev_lat[SMART_IO_DEV_LAT_WINDOW];
@@ -166,8 +173,8 @@ struct smart_io_throttle_ctx {
 	u64 feedback_dispatch_ts_ns;
 	u64 feedback_issue_ts_ns;
 	u8 feedback_vote_count;
-	u8 feedback_fast_votes;
-	u8 feedback_slow_votes;
+	u64 feedback_total_dev_lat_us;
+	u32 feedback_max_dev_lat_us;
 
 	u64 pending_session_id;
 	u64 pending_control_id;
@@ -181,6 +188,15 @@ struct smart_io_throttle_ctx {
 	u32 pending_heavy_pct;
 	bool inference_timed_out;
 	bool inference_running;
+	struct completion model_thread_idle;
+	u64 model_trigger_ts_ns;
+	u64 model_submit_ts_ns;
+	u64 model_thread_start_ts_ns;
+	u64 model_state_ts_ns;
+	u64 model_predict_start_ts_ns;
+	u64 model_predict_end_ts_ns;
+	u64 model_action_apply_ts_ns;
+	bool model_post_apply_pending;
 
 	struct workqueue_struct *inference_wq;
 	struct workqueue_struct *timeout_wq;
@@ -191,7 +207,6 @@ struct smart_io_throttle_ctx {
 	u64 inference_count;
 	u64 timeout_count;
 	u64 invalid_result_count;
-	u64 special_dispatched;
 	u64 fg_dispatched;
 	u64 bg_dispatched;
 	u64 bg_blocked;
@@ -223,10 +238,10 @@ struct smart_io_throttle_stats {
 	u32 queue_max;
 	u32 target_depth;
 	u32 current_depth;
+	u32 bg_current_depth;
 	u32 issued_depth;
 	u32 meta_capacity;
 	u32 meta_inuse;
-	u32 special_pending;
 	u32 fg_pending;
 	u32 bg_pending;
 	u32 dev_lat_threshold_us;
@@ -237,12 +252,11 @@ struct smart_io_throttle_stats {
 	u64 decision_id;
 	u64 feedback_rq_id;
 	u32 feedback_vote_count;
-	u32 feedback_fast_votes;
-	u32 feedback_slow_votes;
+	u32 feedback_mean_dev_lat_us;
+	u32 feedback_max_dev_lat_us;
 	u64 inference_count;
 	u64 timeout_count;
 	u64 invalid_result_count;
-	u64 special_dispatched;
 	u64 fg_dispatched;
 	u64 bg_dispatched;
 	u64 bg_blocked;
@@ -259,6 +273,7 @@ struct smart_io_throttle_stats {
 int smart_io_throttle_queue_init(struct smart_io_throttle_ctx *ctx,
 				 struct request_queue *q);
 void smart_io_throttle_queue_exit(struct smart_io_throttle_ctx *ctx);
+void smart_io_throttle_model_thread_exit(void);
 
 void smart_io_throttle_prepare_request(struct request *rq);
 void smart_io_throttle_classify_request(struct smart_io_throttle_ctx *ctx,
@@ -274,6 +289,12 @@ void smart_io_throttle_finish_request(struct smart_io_throttle_ctx *ctx,
 					struct request *rq);
 
 enum smart_io_rq_class smart_io_throttle_rq_class(const struct request *rq);
+enum smart_io_queue_class
+smart_io_throttle_select_queue(const struct request *rq);
+enum smart_io_queue_class
+smart_io_throttle_select_bio_queue(const struct bio *bio);
+void smart_io_throttle_mark_bio_hp(struct bio *bio);
+void smart_io_throttle_mark_request_hp(struct request *rq);
 bool smart_io_throttle_enabled(void);
 int smart_io_throttle_set_queue_rq_demo(bool enabled);
 bool smart_io_throttle_get_queue_rq_demo(void);
@@ -284,7 +305,7 @@ void smart_io_throttle_dispatch_model_if_needed(
 		struct smart_io_throttle_ctx *ctx);
 bool smart_io_throttle_model_dispatch_needed(
 		struct smart_io_throttle_ctx *ctx);
-bool smart_io_throttle_background_allowed(struct smart_io_throttle_ctx *ctx);
+bool smart_io_throttle_non_hp_allowed(struct smart_io_throttle_ctx *ctx);
 bool smart_io_throttle_deadline_escape_available(
 		struct smart_io_throttle_ctx *ctx);
 bool smart_io_throttle_background_deadline_expired(

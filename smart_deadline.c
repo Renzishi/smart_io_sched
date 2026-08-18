@@ -49,9 +49,9 @@ enum dd_data_dir {
 enum { DD_DIR_COUNT = 2 };
 
 enum dd_prio {
-	DD_RT_PRIO	= 0,
-	DD_BE_PRIO	= 1,
-	DD_IDLE_PRIO	= 2,
+	DD_HP_PRIO	= 0,
+	DD_RT_PRIO	= 1,
+	DD_BE_PRIO	= 2,
 	DD_PRIO_MAX	= 2,
 };
 
@@ -114,7 +114,7 @@ static const enum dd_prio ioprio_class_to_prio[] = {
 	[IOPRIO_CLASS_NONE]	= DD_BE_PRIO,
 	[IOPRIO_CLASS_RT]	= DD_RT_PRIO,
 	[IOPRIO_CLASS_BE]	= DD_BE_PRIO,
-	[IOPRIO_CLASS_IDLE]	= DD_IDLE_PRIO,
+	[IOPRIO_CLASS_IDLE]	= DD_BE_PRIO,
 };
 
 static inline struct rb_root *
@@ -127,7 +127,7 @@ deadline_rb_root(struct dd_per_prio *per_prio, struct request *rq)
  * Returns the I/O priority class (IOPRIO_CLASS_*) that has been assigned to a
  * request.
  */
-static u8 dd_rq_ioclass(struct request *rq)
+static __maybe_unused u8 dd_rq_ioclass(struct request *rq)
 {
 	return IOPRIO_PRIO_CLASS(req_get_ioprio(rq));
 }
@@ -135,7 +135,7 @@ static u8 dd_rq_ioclass(struct request *rq)
 /*
  * Return the first request for which blk_rq_pos() >= @pos.
  */
-static inline struct request *deadline_from_pos(struct dd_per_prio *per_prio,
+static __maybe_unused inline struct request *deadline_from_pos(struct dd_per_prio *per_prio,
 				enum dd_data_dir data_dir, sector_t pos)
 {
 	struct rb_node *node = per_prio->sort_list[data_dir].rb_node;
@@ -195,8 +195,8 @@ static void dd_request_merged(struct request_queue *q, struct request *req,
 			      enum elv_merge type)
 {
 	struct deadline_data *dd = q->elevator->elevator_data;
-	const u8 ioprio_class = dd_rq_ioclass(req);
-	const enum dd_prio prio = ioprio_class_to_prio[ioprio_class];
+	const enum dd_prio prio = (enum dd_prio)
+		smart_io_throttle_select_queue(req);
 	struct dd_per_prio *per_prio = &dd->per_prio[prio];
 
 	/*
@@ -216,8 +216,8 @@ static void dd_merged_requests(struct request_queue *q, struct request *req,
 			       struct request *next)
 {
 	struct deadline_data *dd = q->elevator->elevator_data;
-	const u8 ioprio_class = dd_rq_ioclass(next);
-	const enum dd_prio prio = ioprio_class_to_prio[ioprio_class];
+	const enum dd_prio prio = (enum dd_prio)
+		smart_io_throttle_select_queue(next);
 
 	lockdep_assert_held(&dd->lock);
 
@@ -289,7 +289,7 @@ static inline bool deadline_check_fifo(struct dd_per_prio *per_prio,
  * For the specified data direction, return the next request to
  * dispatch using arrival ordered lists.
  */
-static struct request *
+static __maybe_unused struct request *
 deadline_fifo_request(struct deadline_data *dd, struct dd_per_prio *per_prio,
 		      enum dd_data_dir data_dir)
 {
@@ -303,7 +303,7 @@ deadline_fifo_request(struct deadline_data *dd, struct dd_per_prio *per_prio,
  * For the specified data direction, return the next request to
  * dispatch using sector position sorted lists.
  */
-static struct request *
+static __maybe_unused struct request *
 deadline_next_request(struct deadline_data *dd, struct dd_per_prio *per_prio,
 		      enum dd_data_dir data_dir)
 {
@@ -315,7 +315,7 @@ deadline_next_request(struct deadline_data *dd, struct dd_per_prio *per_prio,
  * Returns true if and only if @rq started after @latest_start where
  * @latest_start is in jiffies.
  */
-static bool started_after(struct deadline_data *dd, struct request *rq,
+static __maybe_unused bool started_after(struct deadline_data *dd, struct request *rq,
 			  unsigned long latest_start)
 {
 	unsigned long start_time = (unsigned long)rq->fifo_time;
@@ -329,6 +329,7 @@ static bool started_after(struct deadline_data *dd, struct request *rq,
  * deadline_dispatch_requests selects the best request according to
  * read/write expire, fifo_batch, etc and with a start time <= @latest_start.
  */
+#if 0 /* Deadline expiry, aging and policy selection are intentionally disabled. */
 static struct request *__dd_dispatch_request(struct deadline_data *dd,
 					     struct dd_per_prio *per_prio,
 					     unsigned long latest_start)
@@ -738,22 +739,19 @@ static struct request *dd_dispatch_request(struct blk_mq_hw_ctx *hctx)
 		goto account;
 	}
 
-	rq = dd_dispatch_class(dd, SMART_IO_RQ_SPECIAL, false);
-	if (rq) {
-		selection = SMART_IO_SELECTION_SPECIAL;
-		goto account;
-	}
-
-	if (dd_find_expired_background(dd, ktime_get_boottime_ns(),
-				       &deadline_candidate)) {
-		rq = dd_dispatch_candidate(dd, &deadline_candidate);
-		selection = SMART_IO_SELECTION_BACKGROUND_DEADLINE;
-		goto account;
-	}
-
 	rq = dd_dispatch_class(dd, SMART_IO_RQ_FOREGROUND, false);
 	if (rq) {
 		selection = SMART_IO_SELECTION_FOREGROUND_FIFO;
+		goto account;
+	}
+
+	if (smart_io_throttle_has_pending(&dd->throttle,
+					 SMART_IO_RQ_BACKGROUND) &&
+	    smart_io_throttle_background_allowed(&dd->throttle) &&
+	    dd_find_expired_background(dd, ktime_get_boottime_ns(),
+					 &deadline_candidate)) {
+		rq = dd_dispatch_candidate(dd, &deadline_candidate);
+		selection = SMART_IO_SELECTION_BACKGROUND_DEADLINE;
 		goto account;
 	}
 
@@ -787,6 +785,61 @@ account:
 		smart_io_throttle_account_dispatch(&dd->throttle, rq, selection);
 
 unlock:
+	spin_unlock(&dd->lock);
+
+	return rq;
+}
+#endif
+
+static struct request *dd_dispatch_fifo(struct deadline_data *dd,
+					struct dd_per_prio *per_prio)
+{
+	struct request *rq;
+	struct request *read_rq;
+	struct request *write_rq;
+
+	if (!list_empty(&per_prio->dispatch)) {
+		rq = list_first_entry(&per_prio->dispatch, struct request,
+					queuelist);
+	} else {
+		read_rq = list_first_entry_or_null(&per_prio->fifo_list[DD_READ],
+							struct request, queuelist);
+		write_rq = list_first_entry_or_null(&per_prio->fifo_list[DD_WRITE],
+							struct request, queuelist);
+		if (!read_rq)
+			rq = write_rq;
+		else if (!write_rq)
+			rq = read_rq;
+		else
+			rq = time_before((unsigned long)read_rq->fifo_time,
+					 (unsigned long)write_rq->fifo_time) ?
+				read_rq : write_rq;
+	}
+	if (!rq)
+		return NULL;
+
+	deadline_move_request(dd, per_prio, rq);
+	per_prio->stats.dispatched++;
+	rq->rq_flags |= RQF_STARTED;
+	return rq;
+}
+
+static struct request *dd_dispatch_request(struct blk_mq_hw_ctx *hctx)
+{
+	struct deadline_data *dd = hctx->queue->elevator->elevator_data;
+	struct request *rq = NULL;
+	enum smart_io_dispatch_selection selection =
+		SMART_IO_SELECTION_BACKGROUND_BASELINE;
+
+	smart_io_throttle_dispatch_model_if_needed(&dd->throttle);
+	spin_lock(&dd->lock);
+	rq = dd_dispatch_fifo(dd, &dd->per_prio[DD_HP_PRIO]);
+	if (!rq && smart_io_throttle_non_hp_allowed(&dd->throttle))
+		rq = dd_dispatch_fifo(dd, &dd->per_prio[DD_RT_PRIO]);
+	if (!rq && smart_io_throttle_non_hp_allowed(&dd->throttle))
+		rq = dd_dispatch_fifo(dd, &dd->per_prio[DD_BE_PRIO]);
+	if (rq)
+		smart_io_throttle_account_dispatch(&dd->throttle, rq, selection);
 	spin_unlock(&dd->lock);
 
 	return rq;
@@ -935,8 +988,8 @@ static int dd_request_merge(struct request_queue *q, struct request **rq,
 			    struct bio *bio)
 {
 	struct deadline_data *dd = q->elevator->elevator_data;
-	const u8 ioprio_class = IOPRIO_PRIO_CLASS(bio->bi_ioprio);
-	const enum dd_prio prio = ioprio_class_to_prio[ioprio_class];
+	const enum dd_prio prio = (enum dd_prio)
+		smart_io_throttle_select_bio_queue(bio);
 	struct dd_per_prio *per_prio = &dd->per_prio[prio];
 	sector_t sector = bio_end_sector(bio);
 	struct request *__rq;
@@ -989,14 +1042,15 @@ static void dd_insert_request(struct blk_mq_hw_ctx *hctx, struct request *rq,
 	struct request_queue *q = hctx->queue;
 	struct deadline_data *dd = q->elevator->elevator_data;
 	const enum dd_data_dir data_dir = rq_data_dir(rq);
-	u16 ioprio = req_get_ioprio(rq);
-	u8 ioprio_class = IOPRIO_PRIO_CLASS(ioprio);
 	struct dd_per_prio *per_prio;
 	enum dd_prio prio;
 
 	lockdep_assert_held(&dd->lock);
 
-	prio = ioprio_class_to_prio[ioprio_class];
+	smart_io_throttle_classify_request(&dd->throttle, rq);
+	prio = (enum dd_prio)smart_io_throttle_select_queue(rq);
+	if (prio == DD_HP_PRIO)
+		smart_io_throttle_mark_request_hp(rq);
 	per_prio = &dd->per_prio[prio];
 	if (!rq->elv.priv[0])
 		per_prio->stats.inserted++;
@@ -1005,7 +1059,6 @@ static void dd_insert_request(struct blk_mq_hw_ctx *hctx, struct request *rq,
 	if (blk_mq_sched_try_insert_merge(q, rq, free))
 		return;
 
-	smart_io_throttle_classify_request(&dd->throttle, rq);
 	trace_block_rq_insert(rq);
 
 	if (flags & BLK_MQ_INSERT_AT_HEAD) {
@@ -1025,7 +1078,8 @@ static void dd_insert_request(struct blk_mq_hw_ctx *hctx, struct request *rq,
 		/*
 		 * set expire time and add to fifo list
 		 */
-		rq->fifo_time = jiffies + dd->fifo_expire[data_dir];
+		/* Keep arrival time for FIFO ordering; deadline expiry is disabled. */
+		rq->fifo_time = jiffies;
 		insert_before = &per_prio->fifo_list[data_dir];
 		list_add_tail(&rq->queuelist, insert_before);
 	}
@@ -1100,15 +1154,13 @@ static bool dd_has_work(struct blk_mq_hw_ctx *hctx)
 	}
 	if (smart_io_throttle_model_dispatch_needed(&dd->throttle))
 		return true;
-	if (smart_io_throttle_has_pending(&dd->throttle, SMART_IO_RQ_SPECIAL) ||
-	    smart_io_throttle_has_pending(&dd->throttle,
-					  SMART_IO_RQ_FOREGROUND))
+	if (dd_has_work_for_prio(&dd->per_prio[DD_HP_PRIO]))
 		return true;
-	if (!smart_io_throttle_has_pending(&dd->throttle,
-					   SMART_IO_RQ_BACKGROUND))
+	if (!dd_has_work_for_prio(&dd->per_prio[DD_RT_PRIO]) &&
+	    !dd_has_work_for_prio(&dd->per_prio[DD_BE_PRIO]))
 		return false;
 
-	return smart_io_throttle_background_allowed(&dd->throttle);
+	return smart_io_throttle_non_hp_allowed(&dd->throttle);
 }
 
 /*
@@ -1226,4 +1278,5 @@ int smart_deadline_init(void)
 void smart_deadline_exit(void)
 {
 	elv_unregister(&smart_deadline_elevator);
+	smart_io_throttle_model_thread_exit();
 }

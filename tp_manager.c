@@ -36,18 +36,18 @@ int smart_io_tp_init(void)
 		return ret;
 	}
 
-	ret = register_filemap_tracepoints();
-	if (ret)
-		smart_io_log_warn("filemap tracepoints unavailable: %d\n", ret);
+	// ret = register_filemap_tracepoints();
+	// if (ret)
+	// 	smart_io_log_warn("filemap tracepoints unavailable: %d\n", ret);
 
-	ret = register_pagecache_demo();
-	if (ret) {
-		unregister_filemap_tracepoints();
-		unregister_psi_tracepoints();
-		unregister_f2fs_tracepoints();
-		unregister_block_tracepoints();
-		return ret;
-	}
+	// ret = register_pagecache_demo();
+	// if (ret) {
+	// 	unregister_filemap_tracepoints();
+	// 	unregister_psi_tracepoints();
+	// 	unregister_f2fs_tracepoints();
+	// 	unregister_block_tracepoints();
+	// 	return ret;
+	// }
 
 	// ret = register_binder_tracepoints();
 	// if (ret) {
@@ -78,8 +78,8 @@ void smart_io_tp_exit(void)
 {
 	// unregister_sched_tracepoints();
 	// unregister_binder_tracepoints();
-	unregister_pagecache_demo();
-	unregister_filemap_tracepoints();
+	// unregister_pagecache_demo();
+	// unregister_filemap_tracepoints();
 	unregister_psi_tracepoints();
 	unregister_f2fs_tracepoints();
 	unregister_block_tracepoints();

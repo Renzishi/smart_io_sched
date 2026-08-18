@@ -13,6 +13,11 @@ static void tp_rq_insert_cb(void *ignore, struct request *rq)
 	smart_io_record_insert(rq);
 }
 
+static void tp_bio_queue_cb(void *ignore, struct bio *bio)
+{
+	smart_io_throttle_mark_bio_hp(bio);
+}
+
 static void tp_rq_issue_cb(void *ignore, struct request *rq)
 {
 	smart_io_throttle_record_issue(rq);
@@ -52,6 +57,7 @@ struct tracepoints_table {
 };
 
 static struct tracepoints_table interests[] = {
+	{ .name = "block_bio_queue", .func = tp_bio_queue_cb },
 	{ .name = "block_bio_remap", .func = tp_bio_remap_cb },
 	{ .name = "block_rq_insert", .func = tp_rq_insert_cb },
 	{ .name = "block_rq_issue", .func = tp_rq_issue_cb },

@@ -308,8 +308,6 @@ static ssize_t action_source_write(struct file *f, const char __user *ub,
 		source = SMART_IO_ACTION_SOURCE_FIXED;
 	else if (!strcmp(strstrip(buf), "model"))
 		source = SMART_IO_ACTION_SOURCE_MODEL;
-	else if (!strcmp(strstrip(buf), "monotonic"))
-		source = SMART_IO_ACTION_SOURCE_MONOTONIC;
 	else
 		return -EINVAL;
 
@@ -596,7 +594,7 @@ static int stats_show(struct seq_file *m, void *v)
 
 	smart_io_throttle_get_stats(&throttle_stats);
 	seq_printf(m,
-		   "io_throttle enabled:%u active:%u inference_pending:%u action_valid:%u source:%s session_id:%llu control_id:%llu decision_id:%llu level:%s policy:%s ratios:%u/%u/%u resolved_ratio:%u queue_max:%u target_depth:%u current_depth:%u reserved_depth:%u issued_depth:%u metadata:capacity=%u,inuse=%u pending:special=%u,fg=%u,bg=%u gate:%s feedback:%s feedback_rq_id:%llu feedback_votes:count=%u,fast=%u,slow=%u threshold_us:%u background_deadline_ms:%u deadline_forced_active:%u\n",
+		   "io_throttle enabled:%u active:%u inference_pending:%u action_valid:%u source:%s session_id:%llu control_id:%llu decision_id:%llu level:%s policy:%s ratios:%u/%u/%u resolved_ratio:%u queue_max:%u target_depth:%u current_depth:%u bg_current_depth:%u reserved_depth:%u issued_depth:%u metadata:capacity=%u,inuse=%u pending:fg=%u,bg=%u gate:%s feedback:%s feedback_rq_id:%llu feedback_samples:count=%u,mean_dev_lat_us=%u,max_dev_lat_us=%u threshold_us:%u background_deadline_ms:%u deadline_forced_active:%u\n",
 		   throttle_stats.enabled ? 1U : 0U,
 		   throttle_stats.active ? 1U : 0U,
 		   throttle_stats.inference_pending ? 1U : 0U,
@@ -609,24 +607,25 @@ static int stats_show(struct seq_file *m, void *v)
 		   throttle_stats.light_pct, throttle_stats.medium_pct,
 		   throttle_stats.heavy_pct, throttle_stats.resolved_ratio_pct,
 		   throttle_stats.queue_max, throttle_stats.target_depth,
-			 throttle_stats.current_depth, throttle_stats.current_depth,
+			 throttle_stats.current_depth, throttle_stats.bg_current_depth,
+			 throttle_stats.current_depth,
 			 throttle_stats.issued_depth, throttle_stats.meta_capacity,
-		   throttle_stats.meta_inuse, throttle_stats.special_pending,
+		   throttle_stats.meta_inuse,
 		   throttle_stats.fg_pending, throttle_stats.bg_pending,
 		   smart_io_gate_reason_name(throttle_stats.gate_reason),
 		   smart_io_feedback_state_name(throttle_stats.feedback_state),
 		   throttle_stats.feedback_rq_id,
 		   throttle_stats.feedback_vote_count,
-		   throttle_stats.feedback_fast_votes,
-		   throttle_stats.feedback_slow_votes,
-		   throttle_stats.dev_lat_threshold_us,
+			 throttle_stats.feedback_mean_dev_lat_us,
+			 throttle_stats.feedback_max_dev_lat_us,
+			 throttle_stats.dev_lat_threshold_us,
 		   throttle_stats.background_deadline_ms,
 		   throttle_stats.deadline_forced_active ? 1U : 0U);
 	seq_printf(m,
-		   "io_throttle_counts queues:%u inference:%llu timeout:%llu invalid:%llu dispatched:special=%llu,fg=%llu,bg=%llu bg_blocked:%llu bg_deadline_forced:%llu selection:baseline=%llu,seq=%llu,seq_fallback=%llu,small=%llu depth_anomalies:%llu feedback_rebind:%llu allocation_failures:%llu\n",
+		   "io_throttle_counts queues:%u inference:%llu timeout:%llu invalid:%llu dispatched:fg=%llu,bg=%llu bg_blocked:%llu bg_deadline_forced:%llu selection:baseline=%llu,seq=%llu,seq_fallback=%llu,small=%llu depth_anomalies:%llu feedback_rebind:%llu allocation_failures:%llu\n",
 		   throttle_stats.active_queues, throttle_stats.inference_count,
 		   throttle_stats.timeout_count, throttle_stats.invalid_result_count,
-		   throttle_stats.special_dispatched, throttle_stats.fg_dispatched,
+		   throttle_stats.fg_dispatched,
 		   throttle_stats.bg_dispatched, throttle_stats.bg_blocked,
 		   throttle_stats.bg_deadline_forced,
 		   throttle_stats.baseline_hits, throttle_stats.seq_hits,
