@@ -44,6 +44,8 @@ struct smart_io_throttle_config {
 
 static atomic_t throttle_enabled = ATOMIC_INIT(0);
 static atomic_t queue_rq_throttle_demo = ATOMIC_INIT(0);
+static atomic_t ux_hp_enabled = ATOMIC_INIT(0);
+static atomic_t rt_read_hp_enabled = ATOMIC_INIT(0);
 static atomic_t dev_lat_threshold_us = ATOMIC_INIT(SMART_IO_DEFAULT_DEV_LAT_US);
 static atomic_t background_deadline_ms =
 	ATOMIC_INIT(SMART_IO_DEFAULT_BACKGROUND_DEADLINE_MS);
@@ -181,6 +183,26 @@ static bool smart_io_throttle_current_uid_is_fg(void)
 	return fg_uid >= 0 && uid == (u32)fg_uid;
 }
 
+static bool smart_io_throttle_current_can_mark_hp(void)
+{
+	if (!smart_io_throttle_current_uid_is_fg())
+		return false;
+	if (!atomic_read(&ux_hp_enabled))
+		return true;
+
+	return current->pid == smart_io_get_fg_main_pid() ||
+		strstr(current->comm, "RenderThread") ||
+		strstr(current->comm, "GLThread");
+}
+
+static bool smart_io_throttle_rt_read_can_mark_hp(u16 ioprio,
+						   unsigned int op)
+{
+	return atomic_read(&rt_read_hp_enabled) &&
+		IOPRIO_PRIO_CLASS(ioprio) == IOPRIO_CLASS_RT &&
+		op == REQ_OP_READ;
+}
+
 enum smart_io_queue_class
 smart_io_throttle_select_queue(const struct request *rq)
 {
@@ -193,7 +215,9 @@ smart_io_throttle_select_queue(const struct request *rq)
 	}
 	if (rq && smart_io_throttle_is_hp_ioprio(req_get_ioprio((struct request *)rq)))
 		return SMART_IO_QUEUE_HP;
-	if (rq && smart_io_throttle_current_uid_is_fg())
+	if (rq && (smart_io_throttle_current_can_mark_hp() ||
+		   smart_io_throttle_rt_read_can_mark_hp(req_get_ioprio((struct request *)rq),
+							       req_op((struct request *)rq))))
 		return SMART_IO_QUEUE_HP;
 
 	return smart_io_throttle_queue_from_ioprio(rq ?
@@ -207,7 +231,8 @@ smart_io_throttle_select_bio_queue(const struct bio *bio)
 		return SMART_IO_QUEUE_BE;
 	if (smart_io_throttle_is_hp_ioprio(bio->bi_ioprio))
 		return SMART_IO_QUEUE_HP;
-	if (smart_io_throttle_current_uid_is_fg())
+	if (smart_io_throttle_current_can_mark_hp() ||
+	    smart_io_throttle_rt_read_can_mark_hp(bio->bi_ioprio, bio_op(bio)))
 		return SMART_IO_QUEUE_HP;
 
 	return smart_io_throttle_queue_from_ioprio(bio->bi_ioprio);
@@ -215,7 +240,9 @@ smart_io_throttle_select_bio_queue(const struct bio *bio)
 
 void smart_io_throttle_mark_bio_hp(struct bio *bio)
 {
-	if (!bio || !smart_io_throttle_current_uid_is_fg())
+	if (!bio || !(smart_io_throttle_current_can_mark_hp() ||
+		      smart_io_throttle_rt_read_can_mark_hp(bio->bi_ioprio,
+								 bio_op(bio))))
 		return;
 
 	bio->bi_ioprio = smart_io_throttle_add_hp_hint(bio->bi_ioprio);
@@ -227,6 +254,28 @@ void smart_io_throttle_mark_request_hp(struct request *rq)
 		return;
 
 	rq->ioprio = smart_io_throttle_add_hp_hint(req_get_ioprio(rq));
+}
+
+int smart_io_throttle_set_ux_hp_enable(bool enabled)
+{
+	atomic_set(&ux_hp_enabled, enabled ? 1 : 0);
+	return 0;
+}
+
+bool smart_io_throttle_get_ux_hp_enable(void)
+{
+	return atomic_read(&ux_hp_enabled) != 0;
+}
+
+int smart_io_throttle_set_rt_read_hp_enable(bool enabled)
+{
+	atomic_set(&rt_read_hp_enabled, enabled ? 1 : 0);
+	return 0;
+}
+
+bool smart_io_throttle_get_rt_read_hp_enable(void)
+{
+	return atomic_read(&rt_read_hp_enabled) != 0;
 }
 
 static enum smart_io_rq_class
@@ -500,8 +549,9 @@ static void smart_io_throttle_trace_dispatch(struct smart_io_throttle_ctx *ctx,
 	if (unlikely(atomic_read(&rawdata_trace_enabled) == 0))
 		return;
 
-	smart_io_raw_emit("io_throttle_dispatch: ts_ns=%llu queue=%p session_id=%llu control_id=%llu decision_id=%llu rq_id=%llu rq_p=%p class=%u op=%u selection=%s level=%s policy=%s current_depth_before=%u current_depth_after=%u bg_current_depth_before=%u bg_current_depth_after=%u reserved_depth_before=%u reserved_depth_after=%u issued_depth_before=%u issued_depth_after=%u target_depth=%u feedback_bound=%u feedback_sample_no=%u queued_wait_us=%llu background_deadline_ms=%u\n",
-			  ktime_get_boottime_ns(), ctx->queue, ctx->session_id,
+	// smart_io_raw_emit("io_throttle_dispatch: ts_ns=%llu queue=%p session_id=%llu control_id=%llu decision_id=%llu rq_id=%llu rq_p=%p class=%u op=%u selection=%s level=%s policy=%s current_depth_before=%u current_depth_after=%u bg_current_depth_before=%u bg_current_depth_after=%u reserved_depth_before=%u reserved_depth_after=%u issued_depth_before=%u issued_depth_after=%u target_depth=%u feedback_bound=%u feedback_sample_no=%u queued_wait_us=%llu background_deadline_ms=%u\n",
+	smart_io_raw_emit("io_throttle_dispatch: ts_ns=%llu session_id=%llu control_id=%llu decision_id=%llu rq_id=%llu rq_p=%p class=%u op=%u selection=%s level=%s policy=%s depth_before=%u depth_after=%u bg_before=%u bg_after=%u issued_before=%u issued_after=%u target_depth=%u feedback_bound=%u feedback_sample_no=%u\n",
+			  ktime_get_boottime_ns(), ctx->session_id,
 			  ctx->control_id, meta ? meta->dispatch_decision_id : 0,
 			  meta ? meta->rq_id : 0,
 			  meta ? (void *)meta->rq : NULL,
@@ -511,12 +561,9 @@ static void smart_io_throttle_trace_dispatch(struct smart_io_throttle_ctx *ctx,
 			  smart_io_throttle_level_name(ctx->action.level),
 			  smart_io_dispatch_policy_name(ctx->action.policy),
 			  depth_before, depth_after, bg_depth_before, bg_depth_after,
-			  depth_before, depth_after,
 			  issued_depth_before, issued_depth_after,
 			  ctx->action.target_depth,
-			  feedback_bound ? 1U : 0U, feedback_sample_no,
-			  queued_wait_us,
-			  smart_io_throttle_get_background_deadline_ms());
+			  feedback_bound ? 1U : 0U, feedback_sample_no);
 }
 
 static void smart_io_throttle_trace_feedback(struct smart_io_throttle_ctx *ctx,
@@ -531,15 +578,14 @@ static void smart_io_throttle_trace_feedback(struct smart_io_throttle_ctx *ctx,
 	if (unlikely(atomic_read(&rawdata_trace_enabled) == 0))
 		return;
 
-	smart_io_raw_emit("io_throttle_feedback: queue=%p session_id=%llu control_id=%llu decision_id=%llu rq_id=%llu rq_p=%p class=%u issue_ts_ns=%llu completion_ts_ns=%llu dev_lat_us=%u threshold_us=%u status=%u nr_bytes=%u sample_no=%u sample_limit=%u total_dev_lat_us=%llu mean_dev_lat_us=%u max_dev_lat_us=%u result=%s level=%s policy=%s target_depth=%u reserved_depth=%u bg_current_depth=%u issued_depth=%u\n",
+	smart_io_raw_emit("io_throttle_feedback: queue=%p session_id=%llu control_id=%llu decision_id=%llu rq_id=%llu rq_p=%p class=%u issue_ts_ns=%llu completion_ts_ns=%llu dev_lat_us=%u status=%u nr_bytes=%u sample_no=%u total_dev_lat_us=%llu mean_dev_lat_us=%u max_dev_lat_us=%u result=%s level=%s policy=%s target_depth=%u reserved_depth=%u bg_current_depth=%u issued_depth=%u\n",
 			  ctx->queue, ctx->session_id, ctx->control_id,
 			  meta ? meta->dispatch_decision_id : 0,
 			  meta ? meta->rq_id : 0,
 			  meta ? (void *)meta->rq : NULL,
 			  meta ? meta->class : SMART_IO_RQ_BACKGROUND,
-			  issue_ns, complete_ns, latency_us,
-			  smart_io_throttle_get_dev_lat_threshold(), (u32)status,
-			  nr_bytes, sample_no, SMART_IO_FEEDBACK_SAMPLE_MAX,
+			  issue_ns, complete_ns, latency_us, (u32)status,
+			  nr_bytes, sample_no,
 			  total_dev_lat_us,
 			  mean_dev_lat_us, max_dev_lat_us, result,
 			  smart_io_throttle_level_name(action ? action->level :

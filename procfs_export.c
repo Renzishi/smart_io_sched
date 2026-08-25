@@ -182,6 +182,64 @@ static int fg_main_pid_open(struct inode *i, struct file *f)
 	return single_open(f, fg_main_pid_show, NULL);
 }
 
+static ssize_t ux_hp_enable_write(struct file *f, const char __user *ub,
+					  size_t c, loff_t *p)
+{
+	int enabled;
+	int ret;
+
+	ret = proc_parse_int(ub, c, &enabled);
+	if (ret)
+		return ret;
+	if (enabled != 0 && enabled != 1)
+		return -EINVAL;
+
+	ret = smart_io_throttle_set_ux_hp_enable(enabled != 0);
+	if (ret)
+		return ret;
+	return c;
+}
+
+static int ux_hp_enable_show(struct seq_file *m, void *v)
+{
+	seq_printf(m, "%d\n", smart_io_throttle_get_ux_hp_enable() ? 1 : 0);
+	return 0;
+}
+
+static int ux_hp_enable_open(struct inode *i, struct file *f)
+{
+	return single_open(f, ux_hp_enable_show, NULL);
+}
+
+static ssize_t rt_read_hp_enable_write(struct file *f, const char __user *ub,
+					       size_t c, loff_t *p)
+{
+	int enabled;
+	int ret;
+
+	ret = proc_parse_int(ub, c, &enabled);
+	if (ret)
+		return ret;
+	if (enabled != 0 && enabled != 1)
+		return -EINVAL;
+
+	ret = smart_io_throttle_set_rt_read_hp_enable(enabled != 0);
+	if (ret)
+		return ret;
+	return c;
+}
+
+static int rt_read_hp_enable_show(struct seq_file *m, void *v)
+{
+	seq_printf(m, "%d\n", smart_io_throttle_get_rt_read_hp_enable() ? 1 : 0);
+	return 0;
+}
+
+static int rt_read_hp_enable_open(struct inode *i, struct file *f)
+{
+	return single_open(f, rt_read_hp_enable_show, NULL);
+}
+
 static ssize_t throttle_enable_write(struct file *f, const char __user *ub,
 				     size_t c, loff_t *p)
 {
@@ -838,7 +896,7 @@ struct proc_node {
 };
 
 struct proc_node proc_nodes[] = {
-	{ 
+	{
 		.name = "enable",
 		.ops = &(struct proc_ops){
 			.proc_open = enable_open,
@@ -888,6 +946,30 @@ struct proc_node proc_nodes[] = {
 			.proc_open = throttle_enable_open,
 			.proc_read = seq_read,
 			.proc_write = throttle_enable_write,
+			.proc_lseek = seq_lseek,
+			.proc_release = single_release,
+		},
+		.mode = 0644,
+		.exist = false,
+	},
+	{
+		.name = "ux_hp_enable",
+		.ops = &(struct proc_ops){
+			.proc_open = ux_hp_enable_open,
+			.proc_read = seq_read,
+			.proc_write = ux_hp_enable_write,
+			.proc_lseek = seq_lseek,
+			.proc_release = single_release,
+		},
+		.mode = 0644,
+		.exist = false,
+	},
+	{
+		.name = "rt_read_hp_enable",
+		.ops = &(struct proc_ops){
+			.proc_open = rt_read_hp_enable_open,
+			.proc_read = seq_read,
+			.proc_write = rt_read_hp_enable_write,
 			.proc_lseek = seq_lseek,
 			.proc_release = single_release,
 		},

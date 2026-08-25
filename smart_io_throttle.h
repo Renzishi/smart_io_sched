@@ -295,6 +295,10 @@ enum smart_io_queue_class
 smart_io_throttle_select_bio_queue(const struct bio *bio);
 void smart_io_throttle_mark_bio_hp(struct bio *bio);
 void smart_io_throttle_mark_request_hp(struct request *rq);
+int smart_io_throttle_set_ux_hp_enable(bool enabled);
+bool smart_io_throttle_get_ux_hp_enable(void);
+int smart_io_throttle_set_rt_read_hp_enable(bool enabled);
+bool smart_io_throttle_get_rt_read_hp_enable(void);
 bool smart_io_throttle_enabled(void);
 int smart_io_throttle_set_queue_rq_demo(bool enabled);
 bool smart_io_throttle_get_queue_rq_demo(void);
