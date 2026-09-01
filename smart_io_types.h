@@ -5,7 +5,7 @@
 #include <linux/percpu.h>
 #include <linux/types.h>
 
-#define SMART_IO_FILE_EXT_STR_LEN 512
+#define SMART_IO_FILE_EXT_STR_LEN 64
 #define SMART_IO_FS_TYPE_LEN 16
 #define SMART_IO_DEV_NAME_LEN 32
 
@@ -27,6 +27,7 @@ enum smart_io_thread_role {
 	ROLE_BACK = 3,
 	ROLE_KWORKER = 4,
 	ROLE_FS_BACK = 5,
+	ROLE_FIO = 6,
 };
 
 enum smart_io_device_type {

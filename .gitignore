@@ -1,3 +1,5 @@
 lookups/
 *_test/
 *.md
+compile_commands.json
+.cache

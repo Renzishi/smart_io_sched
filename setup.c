@@ -3,6 +3,7 @@
 #include "io_semantics.h"
 #include "procfs_export.h"
 #include "smart_deadline.h"
+#include "smart_io_dirtyrate.h"
 #include "smart_io_log.h"
 #include "system_context.h"
 #include "trace_instance.h"
@@ -58,9 +59,17 @@ static int __init smart_io_init(void)
 		goto err_deadline;
 	}
 
+	ret = smart_io_dirtyrate_init();
+	if (ret) {
+		smart_io_log_err("smart_io_dirtyrate_init failed: %d\n", ret);
+		goto err_ufs;
+	}
+
 	smart_io_log_info("module loaded. Tracepoint-based, GKI cautious.\n");
 	return 0;
 
+err_ufs:
+	smart_io_ufs_priority_exit();
 err_deadline:
 	smart_deadline_exit();
 err_ctx:
@@ -75,7 +84,7 @@ err_semantics:
 	return ret;
 }
 
-static void __exit smart_io_exit(void)
+static void __exit __maybe_unused smart_io_exit(void)
 {
 	smart_io_ufs_priority_exit();
 	smart_deadline_exit();
@@ -88,6 +97,6 @@ static void __exit smart_io_exit(void)
 }
 
 module_init(smart_io_init);
-module_exit(smart_io_exit);
+/* module_exit(smart_io_exit); */
 MODULE_LICENSE("GPL");
 MODULE_IMPORT_NS(MINIDUMP);

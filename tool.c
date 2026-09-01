@@ -22,6 +22,11 @@ u32 pages_to_mb(unsigned long pages)
 	return (u32)div_u64((u64)pages << PAGE_SHIFT, SZ_1M);
 }
 
+u32 pages_to_kb(unsigned long pages)
+{
+	return (u32)div_u64((u64)pages << PAGE_SHIFT, SZ_1K);
+}
+
 u8 encode_io_op(unsigned int op)
 {
 	switch (op) {
@@ -68,6 +73,8 @@ u8 match_thread_role(uid_t uid, pid_t pid, pid_t tid, const char *comm, uid_t fg
 			return ROLE_KWORKER;
 		if (strstarts(comm, "jbd2/") || strstarts(comm, "f2fs_"))
 			return ROLE_FS_BACK;
+		if (strstarts(comm, "fio"))
+			return ROLE_FIO;
 		return ROLE_UNKNOWN;
 	}
 

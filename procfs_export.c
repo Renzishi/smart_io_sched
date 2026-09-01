@@ -6,6 +6,7 @@
 #include "filter.h"
 #include "io_semantics.h"
 #include "procfs_export.h"
+#include "smart_io_dirtyrate.h"
 #include "smart_io_log.h"
 #include "smart_io_policy.h"
 #include "smart_io_throttle.h"
@@ -125,6 +126,84 @@ static int proc_parse_u32(const char __user *ub, size_t c, u32 *val)
 
 	return kstrtou32(strstrip(buf), 10, val);
 }
+
+static int proc_parse_u64(const char __user *ub, size_t c, u64 *val)
+{
+	char buf[32];
+
+	if (c > sizeof(buf) - 1)
+		return -E2BIG;
+	if (copy_from_user(buf, ub, c))
+		return -EFAULT;
+	buf[c] = 0;
+
+	return kstrtou64(strstrip(buf), 10, val);
+}
+
+static ssize_t dirtyrate_enable_write(struct file *f,
+					      const char __user *ub, size_t c,
+					      loff_t *p)
+{
+	int enabled;
+	int ret = proc_parse_int(ub, c, &enabled);
+
+	if (ret || (enabled != 0 && enabled != 1))
+		return ret ?: -EINVAL;
+	ret = smart_io_dirtyrate_set_enabled(enabled != 0);
+	return ret ?: c;
+}
+
+static int dirtyrate_enable_show(struct seq_file *m, void *v)
+{
+	seq_printf(m, "%d\n", smart_io_dirtyrate_get_enabled() ? 1 : 0);
+	return 0;
+}
+
+static int dirtyrate_enable_open(struct inode *i, struct file *f)
+{
+	return single_open(f, dirtyrate_enable_show, NULL);
+}
+
+static ssize_t dirtyrate_wkbps_write(struct file *f,
+					     const char __user *ub, size_t c,
+					     loff_t *p)
+{
+	u64 wkbps;
+	int ret = proc_parse_u64(ub, c, &wkbps);
+
+	if (ret)
+		return ret;
+	ret = smart_io_dirtyrate_set_wkbps(wkbps);
+	return ret ?: c;
+}
+
+static int dirtyrate_wkbps_show(struct seq_file *m, void *v)
+{
+	seq_printf(m, "%llu\n",
+		   (unsigned long long)smart_io_dirtyrate_get_wkbps());
+	return 0;
+}
+
+static int dirtyrate_wkbps_open(struct inode *i, struct file *f)
+{
+	return single_open(f, dirtyrate_wkbps_show, NULL);
+}
+
+static const struct proc_ops dirtyrate_enable_ops = {
+	.proc_open = dirtyrate_enable_open,
+	.proc_read = seq_read,
+	.proc_write = dirtyrate_enable_write,
+	.proc_lseek = seq_lseek,
+	.proc_release = single_release,
+};
+
+static const struct proc_ops dirtyrate_wkbps_ops = {
+	.proc_open = dirtyrate_wkbps_open,
+	.proc_read = seq_read,
+	.proc_write = dirtyrate_wkbps_write,
+	.proc_lseek = seq_lseek,
+	.proc_release = single_release,
+};
 
 static ssize_t fg_uid_write(struct file *f, const char __user *ub, size_t c,
 			    loff_t *p)
@@ -855,6 +934,37 @@ static int pagecache_demo_open(struct inode *i, struct file *f)
 	return single_open(f, pagecache_demo_show, NULL);
 }
 
+static ssize_t pagecache_demo_observe_write(struct file *f,
+					    const char __user *ub, size_t c, loff_t *p)
+{
+	char buf[8];
+	int val;
+
+	if (c > sizeof(buf) - 1)
+		return -EINVAL;
+	if (copy_from_user(buf, ub, c))
+		return -EFAULT;
+	buf[c] = 0;
+	if (kstrtoint(strstrip(buf), 10, &val))
+		return -EINVAL;
+
+	smart_io_pagecache_demo_set_observe(val != 0);
+	smart_io_log_info("pagecache demo observation %s.\n",
+			  val ? "enabled" : "disabled");
+	return c;
+}
+
+static int pagecache_demo_observe_show(struct seq_file *m, void *v)
+{
+	seq_printf(m, "%d\n", smart_io_pagecache_demo_observe_enabled() ? 1 : 0);
+	return 0;
+}
+
+static int pagecache_demo_observe_open(struct inode *i, struct file *f)
+{
+	return single_open(f, pagecache_demo_observe_show, NULL);
+}
+
 static ssize_t debug_write(struct file *f, const char __user *ub, size_t c,
 			  loff_t *p)
 {
@@ -896,6 +1006,18 @@ struct proc_node {
 };
 
 struct proc_node proc_nodes[] = {
+	{
+		.name = "dirtyrate_enable",
+		.ops = &dirtyrate_enable_ops,
+		.mode = 0644,
+		.exist = false,
+	},
+	{
+		.name = "dirtyrate_wkbps",
+		.ops = &dirtyrate_wkbps_ops,
+		.mode = 0644,
+		.exist = false,
+	},
 	{
 		.name = "enable",
 		.ops = &(struct proc_ops){
@@ -1112,6 +1234,18 @@ struct proc_node proc_nodes[] = {
 			.proc_open = pagecache_demo_open,
 			.proc_read = seq_read,
 			.proc_write = pagecache_demo_write,
+			.proc_lseek = seq_lseek,
+			.proc_release = single_release,
+		},
+		.mode = 0666,
+		.exist = false,
+	},
+	{
+		.name = "pagecache_demo_observe",
+		.ops = &(struct proc_ops){
+			.proc_open = pagecache_demo_observe_open,
+			.proc_read = seq_read,
+			.proc_write = pagecache_demo_observe_write,
 			.proc_lseek = seq_lseek,
 			.proc_release = single_release,
 		},

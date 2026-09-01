@@ -1,4 +1,11 @@
 load("//build/kernel/kleaf:kernel.bzl", "ddk_module")
+load("//build/kernel/kleaf:kernel.bzl",
+     "ddk_module", "kernel_compile_commands")
+
+kernel_compile_commands(
+    name = "smart_io_sched_compile_commands",
+    deps = [":smart_io_sched"],
+)
 
 ddk_module(
     name = "smart_io_sched",

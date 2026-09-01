@@ -18,16 +18,19 @@
 #include <linux/user_namespace.h>
 #include <linux/wait.h>
 #include <linux/bio.h>
+#include <linux/blkdev.h>
 
 #include <block/blk.h>
 
 #include "smart_io_model_fp32.h"
+#include "block_helper.h"
 #include "smart_io_throttle.h"
 #include "system_context.h"
 #include "trace_instance.h"
 
 // #define SMART_IO_DEFAULT_DEV_LAT_US 4000U
-#define SMART_IO_DEFAULT_DEV_LAT_US 800U
+// #define SMART_IO_DEFAULT_DEV_LAT_US 800U
+#define SMART_IO_DEFAULT_DEV_LAT_US 600U
 #define SMART_IO_DEFAULT_LIGHT_PCT 75U
 #define SMART_IO_DEFAULT_MEDIUM_PCT 50U
 #define SMART_IO_DEFAULT_HEAVY_PCT 25U
@@ -109,12 +112,12 @@ static const char * const feedback_state_names[] = {
 };
 
 static const char * const selection_names[] = {
-	[SMART_IO_SELECTION_FOREGROUND_FIFO] = "foreground_fifo",
+	[SMART_IO_SELECTION_FOREGROUND_FIFO] = "fg_fifo",
 	[SMART_IO_SELECTION_SEQ_HIT] = "seq_hit",
 	[SMART_IO_SELECTION_SEQ_FALLBACK] = "seq_fallback",
 	[SMART_IO_SELECTION_SMALL] = "small",
-	[SMART_IO_SELECTION_BACKGROUND_BASELINE] = "background_baseline",
-	[SMART_IO_SELECTION_BACKGROUND_DEADLINE] = "background_deadline",
+	[SMART_IO_SELECTION_BACKGROUND_BASELINE] = "bg_baseline",
+	[SMART_IO_SELECTION_BACKGROUND_DEADLINE] = "bg_deadline",
 };
 
 static_assert(SMART_IO_MODEL_FP32_INPUTS == 11U);
@@ -144,6 +147,21 @@ static inline void smart_io_throttle_set_rq_meta(struct request *rq,
 						 struct smart_io_rq_meta *meta)
 {
 	WRITE_ONCE(rq->elv.priv[1], meta);
+}
+
+static bool smart_io_throttle_device_time_excluded(const struct request *rq,
+						   u32 *tag_depth_max)
+{
+	char dev_name[SMART_IO_DEV_NAME_LEN] = "unknown";
+	u32 depth = rq && rq->q ? blk_queue_depth(rq->q) : 0;
+
+	if (tag_depth_max)
+		*tag_depth_max = depth;
+	if (!rq)
+		return false;
+
+	extract_device_name((struct request *)rq, dev_name, sizeof(dev_name));
+	return !strncmp(dev_name, "loop", 4);
 }
 
 #define SMART_IO_HP_IOPRIO_HINT IOPRIO_HINT_MASK
@@ -463,8 +481,8 @@ static void smart_io_throttle_trace_decision(struct smart_io_throttle_ctx *ctx,
 	if (unlikely(atomic_read(&rawdata_trace_enabled) == 0))
 		return;
 
-	smart_io_raw_emit("io_throttle_decision: ts_ns=%llu queue=%p session_id=%llu control_id=%llu decision_id=%llu trigger=%s result=%s source=%s model_impl=%s action_id=%u level=%s policy=%s ratio_pct=%u queue_max=%u target_depth=%u current_depth=%u bg_current_depth=%u reserved_depth=%u issued_depth=%u\n",
-			  ktime_get_boottime_ns(), ctx->queue, session_id,
+	smart_io_raw_emit("io_throttle_decision: ts_ns=%llu control_id=%llu decision_id=%llu trigger=%s result=%s source=%s model_impl=%s action_id=%u level=%s policy=%s ratio_pct=%u queue_max=%u target_depth=%u current_depth=%u bg_current_depth=%u reserved_depth=%u issued_depth=%u\n",
+			  ktime_get_boottime_ns(),
 			  control_id, decision_id, trigger, result,
 			  smart_io_action_source_name(ctx->pending_source),
 			  model_impl, action_id,
@@ -484,8 +502,8 @@ static void smart_io_throttle_trace_state(
 	if (unlikely(atomic_read(&rawdata_trace_enabled) == 0))
 		return;
 
-	smart_io_raw_emit("io_rl_state: decision_ts_ns=%llu queue=%p session_id=%llu control_id=%llu decision_id=%llu valid=%u threshold_us=%u device_q_count=%u reserved_depth_count=%u device_q_fg_count=%u device_q_slow_count=%u queue_max=%u window_complete_count=%u window_mean_dev_us=%u window_span_us=%u window_slow_count=%u window_fg_complete_count=%u waiting_total_count=%u waiting_count=%u waiting_fg=%u waiting_high_ioprio_count=%u waiting_to_issued_contiguous_count=%u\n",
-			  state->decision_ts_ns, ctx->queue, session_id,
+	smart_io_raw_emit("io_rl_state: decision_ts_ns=%llu control_id=%llu decision_id=%llu valid=%u threshold_us=%u device_q=%u reserved_depth=%u device_q_fg=%u device_q_slow=%u queue_max=%u window_complete=%u window_mean_dev_us=%u window_span_us=%u window_slow=%u window_fg_complete=%u waiting_total=%u waiting=%u waiting_fg=%u waiting_high_ioprio=%u waiting_to_issued_contiguous=%u\n",
+			  state->decision_ts_ns,
 			  control_id, decision_id, valid ? 1U : 0U,
 			  state->dev_lat_threshold_us,
 			  state->device_q_count, state->reserved_depth_count,
@@ -508,8 +526,8 @@ static void smart_io_throttle_trace_model_thread_submit(
 	if (unlikely(atomic_read(&rawdata_trace_enabled) == 0))
 		return;
 
-	smart_io_raw_emit("io_model_thread_submit: queue=%p session_id=%llu control_id=%llu decision_id=%llu trigger_ts_ns=%llu dispatch_submit_ts_ns=%llu\n",
-			  ctx->queue, session_id, control_id, decision_id,
+	smart_io_raw_emit("io_model_thread_submit: control_id=%llu decision_id=%llu trigger_ts_ns=%llu dispatch_submit_ts_ns=%llu\n",
+			  control_id, decision_id,
 			  trigger_ts_ns, submit_ts_ns);
 }
 
@@ -520,8 +538,8 @@ static void smart_io_throttle_trace_model_thread_apply(
 	if (unlikely(atomic_read(&rawdata_trace_enabled) == 0))
 		return;
 
-	smart_io_raw_emit("io_model_thread_apply: queue=%p session_id=%llu control_id=%llu decision_id=%llu action_apply_ts_ns=%llu\n",
-			  ctx->queue, session_id, control_id, decision_id, apply_ts_ns);
+	smart_io_raw_emit("io_model_thread_apply: control_id=%llu decision_id=%llu action_apply_ts_ns=%llu\n",
+			  control_id, decision_id, apply_ts_ns);
 }
 
 static void smart_io_throttle_trace_model_thread_dispatch(
@@ -531,8 +549,8 @@ static void smart_io_throttle_trace_model_thread_dispatch(
 	if (unlikely(atomic_read(&rawdata_trace_enabled) == 0))
 		return;
 
-	smart_io_raw_emit("io_model_thread_dispatch: queue=%p session_id=%llu control_id=%llu decision_id=%llu first_dispatch_after_apply_ts_ns=%llu\n",
-			  ctx->queue, session_id, control_id, decision_id, dispatch_ts_ns);
+	smart_io_raw_emit("io_model_thread_dispatch: control_id=%llu decision_id=%llu first_dispatch_after_apply_ts_ns=%llu\n",
+			  control_id, decision_id, dispatch_ts_ns);
 }
 
 static void smart_io_throttle_trace_dispatch(struct smart_io_throttle_ctx *ctx,
@@ -550,20 +568,17 @@ static void smart_io_throttle_trace_dispatch(struct smart_io_throttle_ctx *ctx,
 		return;
 
 	// smart_io_raw_emit("io_throttle_dispatch: ts_ns=%llu queue=%p session_id=%llu control_id=%llu decision_id=%llu rq_id=%llu rq_p=%p class=%u op=%u selection=%s level=%s policy=%s current_depth_before=%u current_depth_after=%u bg_current_depth_before=%u bg_current_depth_after=%u reserved_depth_before=%u reserved_depth_after=%u issued_depth_before=%u issued_depth_after=%u target_depth=%u feedback_bound=%u feedback_sample_no=%u queued_wait_us=%llu background_deadline_ms=%u\n",
-	smart_io_raw_emit("io_throttle_dispatch: ts_ns=%llu session_id=%llu control_id=%llu decision_id=%llu rq_id=%llu rq_p=%p class=%u op=%u selection=%s level=%s policy=%s depth_before=%u depth_after=%u bg_before=%u bg_after=%u issued_before=%u issued_after=%u target_depth=%u feedback_bound=%u feedback_sample_no=%u\n",
-			  ktime_get_boottime_ns(), ctx->session_id,
+	smart_io_raw_emit("io_throttle_dispatch: ts_ns=%llu control_id=%llu decision_id=%llu rq_p=%p class=%u selection=%s level=%s policy=%s depth_before=%u depth_after=%u bg_before=%u bg_after=%u issued_before=%u issued_after=%u target_depth=%u\n",
+			  ktime_get_boottime_ns(),
 			  ctx->control_id, meta ? meta->dispatch_decision_id : 0,
-			  meta ? meta->rq_id : 0,
 			  meta ? (void *)meta->rq : NULL,
 			  meta ? meta->class : SMART_IO_RQ_BACKGROUND,
-			  meta ? meta->op : REQ_OP_FLUSH,
 			  selection_names[selection],
 			  smart_io_throttle_level_name(ctx->action.level),
 			  smart_io_dispatch_policy_name(ctx->action.policy),
 			  depth_before, depth_after, bg_depth_before, bg_depth_after,
 			  issued_depth_before, issued_depth_after,
-			  ctx->action.target_depth,
-			  feedback_bound ? 1U : 0U, feedback_sample_no);
+			  ctx->action.target_depth);
 }
 
 static void smart_io_throttle_trace_feedback(struct smart_io_throttle_ctx *ctx,
@@ -578,10 +593,9 @@ static void smart_io_throttle_trace_feedback(struct smart_io_throttle_ctx *ctx,
 	if (unlikely(atomic_read(&rawdata_trace_enabled) == 0))
 		return;
 
-	smart_io_raw_emit("io_throttle_feedback: queue=%p session_id=%llu control_id=%llu decision_id=%llu rq_id=%llu rq_p=%p class=%u issue_ts_ns=%llu completion_ts_ns=%llu dev_lat_us=%u status=%u nr_bytes=%u sample_no=%u total_dev_lat_us=%llu mean_dev_lat_us=%u max_dev_lat_us=%u result=%s level=%s policy=%s target_depth=%u reserved_depth=%u bg_current_depth=%u issued_depth=%u\n",
-			  ctx->queue, ctx->session_id, ctx->control_id,
+	smart_io_raw_emit("io_throttle_feedback: control_id=%llu decision_id=%llu rq_p=%p class=%u issue_ts_ns=%llu completion_ts_ns=%llu dev_lat_us=%u status=%u nr_bytes=%u sample_no=%u total_dev_lat_us=%llu mean_dev_lat_us=%u max_dev_lat_us=%u result=%s level=%s policy=%s target_depth=%u reserved_depth=%u bg_cur_depth=%u issued_depth=%u\n",
+			  ctx->control_id,
 			  meta ? meta->dispatch_decision_id : 0,
-			  meta ? meta->rq_id : 0,
 			  meta ? (void *)meta->rq : NULL,
 			  meta ? meta->class : SMART_IO_RQ_BACKGROUND,
 			  issue_ns, complete_ns, latency_us, (u32)status,
@@ -591,7 +605,7 @@ static void smart_io_throttle_trace_feedback(struct smart_io_throttle_ctx *ctx,
 			  smart_io_throttle_level_name(action ? action->level :
 						 ctx->action.level),
 			  smart_io_dispatch_policy_name(action ? action->policy :
-						 ctx->action.policy),
+							ctx->action.policy),
 			  action ? action->target_depth : ctx->action.target_depth,
 			  READ_ONCE(ctx->current_depth), READ_ONCE(ctx->bg_current_depth),
 			  READ_ONCE(ctx->issued_depth));
@@ -606,8 +620,8 @@ static void smart_io_throttle_trace_gate(struct smart_io_throttle_ctx *ctx,
 	if (unlikely(atomic_read(&rawdata_trace_enabled) == 0))
 		return;
 
-	smart_io_raw_emit("io_throttle_gate: ts_ns=%llu queue=%p session_id=%llu control_id=%llu decision_id=%llu event=%s reason=%s current_depth=%u bg_current_depth=%u reserved_depth=%u issued_depth=%u target_depth=%u bg_pending=%u\n",
-			  ktime_get_boottime_ns(), ctx->queue, ctx->session_id,
+	smart_io_raw_emit("io_throttle_gate: ts_ns=%llu control_id=%llu decision_id=%llu event=%s reason=%s cur_depth=%u bg_cur_depth=%u reserved_depth=%u issued_depth=%u target_depth=%u bg_pending=%u\n",
+			  ktime_get_boottime_ns(),
 			  ctx->control_id, ctx->decision_id, event,
 			  smart_io_gate_reason_name(reason), current_depth, bg_current_depth,
 			  current_depth,
@@ -659,6 +673,8 @@ smart_io_throttle_alloc_meta_locked(struct smart_io_throttle_ctx *ctx,
 	meta->op = req_op(rq);
 	meta->start_sector = blk_rq_pos(rq);
 	meta->end_sector = meta->start_sector + blk_rq_sectors(rq);
+	meta->device_time_excluded =
+		smart_io_throttle_device_time_excluded(rq, &meta->tag_depth_max);
 	meta->high_ioprio =
 		IOPRIO_PRIO_CLASS(req_get_ioprio(rq)) == IOPRIO_CLASS_RT;
 	meta->rq_id = ++ctx->next_rq_id;
@@ -994,8 +1010,8 @@ static void smart_io_throttle_inference_work(struct work_struct *work)
 		    (u64)SMART_IO_INFERENCE_TIMEOUT_MS * NSEC_PER_MSEC)
 			ret = -ETIMEDOUT;
 		if (unlikely(trace_model_timing))
-			smart_io_raw_emit("io_model_inference: queue=%p session_id=%llu control_id=%llu decision_id=%llu trigger_ts_ns=%llu dispatch_submit_ts_ns=%llu thread_start_ts_ns=%llu state_ts_ns=%llu predict_start_ts_ns=%llu predict_end_ts_ns=%llu input_prepare_ns=%llu simd_check_ns=%llu neon_begin_ns=%llu forward_ns=%llu neon_end_ns=%llu output_check_ns=%llu predict_total_ns=%llu elapsed_ns=%llu ret=%d\n",
-					  ctx->queue, session_id, control_id, decision_id,
+			smart_io_raw_emit("io_model_inference: control_id=%llu decision_id=%llu trigger_ts_ns=%llu dispatch_submit_ts_ns=%llu thread_start_ts_ns=%llu state_ts_ns=%llu predict_start_ts_ns=%llu predict_end_ts_ns=%llu input_prepare_ns=%llu simd_check_ns=%llu neon_begin_ns=%llu forward_ns=%llu neon_end_ns=%llu output_check_ns=%llu predict_total_ns=%llu elapsed_ns=%llu ret=%d\n",
+					  control_id, decision_id,
 					  model_trigger_ts_ns, model_submit_ts_ns,
 					  model_thread_start_ts_ns, model_state_ts_ns,
 					  model_predict_start_ts_ns, model_predict_end_ts_ns,
@@ -1532,6 +1548,9 @@ void smart_io_throttle_update_request(struct smart_io_throttle_ctx *ctx,
 		meta->op = req_op(rq);
 		meta->start_sector = blk_rq_pos(rq);
 		meta->end_sector = meta->start_sector + blk_rq_sectors(rq);
+		meta->device_time_excluded =
+			smart_io_throttle_device_time_excluded(rq,
+							       &meta->tag_depth_max);
 		meta->high_ioprio =
 			IOPRIO_PRIO_CLASS(req_get_ioprio(rq)) == IOPRIO_CLASS_RT;
 	}
@@ -1592,6 +1611,8 @@ void smart_io_throttle_account_dispatch(struct smart_io_throttle_ctx *ctx,
 	}
 
 	class = meta->class;
+	meta->device_time_excluded =
+		smart_io_throttle_device_time_excluded(rq, &meta->tag_depth_max);
 	now_ns = ktime_get_boottime_ns();
 	if (meta->queued_ts_ns && now_ns > meta->queued_ts_ns)
 		queued_wait_us = div_u64(now_ns - meta->queued_ts_ns,
@@ -1646,7 +1667,8 @@ void smart_io_throttle_account_dispatch(struct smart_io_throttle_ctx *ctx,
 		break;
 	}
 
-	if (smart_io_throttle_enabled() && ctx->throttle_active &&
+	if (!meta->device_time_excluded &&
+	    smart_io_throttle_enabled() && ctx->throttle_active &&
 	    ctx->action_valid && !ctx->inference_pending &&
 	    ctx->feedback_state == SMART_IO_FEEDBACK_WAIT_DISPATCH &&
 	    ctx->feedback_vote_count < SMART_IO_FEEDBACK_SAMPLE_MAX) {
@@ -2046,7 +2068,8 @@ static bool smart_io_throttle_snapshot_state_locked(
 			issued_seen++;
 			if (meta->class == SMART_IO_RQ_FOREGROUND)
 				state->device_q_fg_count++;
-			if (meta->issue_ts_ns && now_ns >= meta->issue_ts_ns &&
+			if (!meta->device_time_excluded && meta->issue_ts_ns &&
+			    now_ns >= meta->issue_ts_ns &&
 			    now_ns - meta->issue_ts_ns >=
 				    (u64)threshold_us * NSEC_PER_USEC)
 				state->device_q_slow_count++;
@@ -2118,6 +2141,9 @@ void smart_io_throttle_record_issue(struct request *rq)
 		goto run_queues;
 	}
 
+	/* Recheck the originating queue at issue, including reissued requests. */
+	meta->device_time_excluded =
+		smart_io_throttle_device_time_excluded(rq, &meta->tag_depth_max);
 	if (!meta->depth_accounted)
 		wake = smart_io_throttle_account_depth_locked(ctx, meta);
 	if (!meta->issued_accounted)
@@ -2131,7 +2157,7 @@ void smart_io_throttle_record_issue(struct request *rq)
 		meta->issue_session_id = smart_io_throttle_enabled() ?
 			ctx->session_id : 0;
 	}
-	if (ctx->feedback_meta == meta &&
+	if (!meta->device_time_excluded && ctx->feedback_meta == meta &&
 	    ctx->feedback_state == SMART_IO_FEEDBACK_WAIT_ISSUE &&
 	    meta->dispatch_decision_id == ctx->action.decision_id) {
 		ctx->feedback_issue_ts_ns = meta->issue_ts_ns;
@@ -2283,7 +2309,8 @@ void smart_io_throttle_record_complete(struct request *rq, blk_status_t status,
 	}
 	if (final && latency_valid && !meta->completion_sampled) {
 		meta->completion_sampled = true;
-		if (smart_io_throttle_enabled() &&
+		if (!meta->device_time_excluded &&
+		    smart_io_throttle_enabled() &&
 		    meta->issue_session_id == ctx->session_id) {
 			ctx->dev_lat[ctx->dev_lat_head].complete_ts_ns = now_ns;
 			ctx->dev_lat[ctx->dev_lat_head].dev_lat_us = latency_us;
@@ -2300,7 +2327,8 @@ void smart_io_throttle_record_complete(struct request *rq, blk_status_t status,
 		}
 	}
 
-	if (final && latency_valid && ctx->feedback_meta == meta &&
+	if (final && latency_valid && !meta->device_time_excluded &&
+	    ctx->feedback_meta == meta &&
 	    ctx->feedback_state == SMART_IO_FEEDBACK_WAIT_COMPLETE &&
 	    ctx->feedback_issue_ts_ns) {
 		feedback_complete = true;

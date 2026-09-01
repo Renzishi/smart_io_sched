@@ -131,12 +131,12 @@ static const char *classify_mapping_reason(struct folio *folio,
 
 	if (folio_test_swapcache(folio)) {
 		*stable = true;
-		return "swap_nomapping";
+		return "swap_nomap";
 	}
 
 	if (folio_test_anon(folio)) {
 		*stable = true;
-		return "anon_nomapping";
+		return "anon_nomap";
 	}
 
 	return "nomapping";
@@ -156,7 +156,7 @@ static const char *classify_hostless_mapping(struct folio *folio, bool *stable)
 		return "anon_nohost";
 	}
 
-	return "hostless_mapping";
+	return "hostless";
 }
 
 static const char *classify_inode_identity(struct inode *inode,
@@ -222,6 +222,7 @@ bool extract_vfs_info(struct bio *bio, u64 *inode_hash, u16 *ext, u64 *folio_ind
 	char class_buf[64];
 	char path_buf[512];
 	char *full_path;
+	const char *file_name;
 
 	if (!bio_has_data(bio)) {
 		set_vfs_placeholder(ext_str, ext_str_len, "nodata");
@@ -292,7 +293,12 @@ bool extract_vfs_info(struct bio *bio, u64 *inode_hash, u16 *ext, u64 *folio_ind
 		return false;
 	}
 
-	strscpy(ext_str, full_path, ext_str_len);
+	file_name = strrchr(full_path, '/');
+	if (file_name)
+		file_name++;
+	if (!file_name || !*file_name)
+		file_name = full_path;
+	strscpy(ext_str, file_name, ext_str_len);
 	return true;
 }
 

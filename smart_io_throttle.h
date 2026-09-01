@@ -16,7 +16,6 @@
 #define SMART_IO_FEEDBACK_SAMPLE_MAX 5
 #define SMART_IO_ACTIVE_HASH_BITS 6
 #define SMART_IO_INFLIGHT_HASH_BITS 6
-
 enum smart_io_rq_class {
 	SMART_IO_RQ_FOREGROUND,
 	SMART_IO_RQ_BACKGROUND,
@@ -123,6 +122,7 @@ struct smart_io_rq_meta {
 	u64 issue_session_id;
 	u64 dispatch_decision_id;
 	u64 queued_ts_ns;
+	u32 tag_depth_max;
 	bool queued;
 	bool depth_accounted; /* current_depth reservation */
 	bool bg_depth_accounted; /* bg_current_depth reservation */
@@ -132,6 +132,7 @@ struct smart_io_rq_meta {
 	bool completion_sampled;
 	bool deadline_forced;
 	bool high_ioprio;
+	bool device_time_excluded;
 };
 
 struct smart_io_throttle_ctx {

@@ -22,6 +22,7 @@ unsigned int rq_shard_idx(const struct request *rq);
 unsigned int uid_hash_idx(u32 uid);
 unsigned int ino_hash_idx(u64 ino);
 u32 get_swap_used_mb(void);
+u32 pages_to_kb(unsigned long pages);
 u32 get_runqueue_len(void);
 u64 calc_reclaim_pages(void);
 bool smart_io_snapshot_task_state(pid_t tid, unsigned long *state_out, int *cpuid_out, u64 *u_s_time_out);

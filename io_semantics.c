@@ -209,25 +209,6 @@ u32 get_nr_bio(struct request *rq)
 	return count;
 }
 
-static u32 get_nr_segment(struct request *rq)
-{
-	if (!rq)
-		return 0;
-
-	return blk_rq_nr_phys_segments(rq);
-}
-
-static int get_rq_tag(struct request *rq)
-{
-	if (!rq)
-		return BLK_MQ_NO_TAG;
-
-	if (rq->tag != BLK_MQ_NO_TAG)
-		return rq->tag;
-
-	return rq->internal_tag;
-}
-
 static u32 get_rq_tag_depth_max(struct request *rq)
 {
 	if (!rq || !rq->q)
@@ -539,8 +520,7 @@ static bool smart_io_is_hot_read_candidate(const struct smart_io_event *event)
 	    event->file_ext != SMART_IO_FILE_EXT_VDEX)
 		return false;
 
-	return event->is_front ||
-		IOPRIO_PRIO_CLASS(event->ioprio_class) == IOPRIO_CLASS_RT;
+	return event->is_front;
 }
 
 static u8 snapshot_device_util(void)
@@ -674,88 +654,105 @@ void f2fs_cp_end(void)
 static void emit_raw_insert(const struct smart_io_event *evt,
 				     struct request *rq)
 {
-	u32 nr_segment = get_nr_segment(rq);
-	int tag = get_rq_tag(rq);
 	u32 tag_depth_max = get_rq_tag_depth_max(rq);
 	int tag_depth_cur = get_rq_tag_depth_cur(rq);
 
+	if (evt->thread_role == ROLE_FIO) {
+		smart_io_raw_emit("block_rq_insert: "
+			  "ts_insert=%llu rq_p=%p thread_role=%u tag_max=%u tag_cur=%d\n",
+			  evt->ts_insert, (void *)rq, evt->thread_role, tag_depth_max, tag_depth_cur);
+		return;
+	}
+
 	smart_io_raw_emit("block_rq_insert: "
-			  "ts_insert=%llu uid=%u pid=%d tgid=%d rq_p=%p io_op=%u io_size=%u cmd=%u "
+			  "ts_insert=%llu uid=%u pid=%d tgid=%d rq_p=%p io_size=%u cmd=%u "
 			  "sector=%llu ioprio=%u file_ext=%u file_ext_s=%s fg=%u thread_role=%u "
-			  "fs_type=%s dev_name=%s remap_from=%s remap_mixed=%u dev_type=%u is_sync=%u "
-			  "inode_hash=%llu folio_index=%llu io_inflight=%u queue_sat=%u "
-			  "nr_segment=%u tag=%d tag_depth_max=%u tag_depth_cur=%d\n",
+			  "fs_type=%s dev_name=%s remap_from=%s remap_mixed=%u "
+			  "inode_hash=%llu folio_index=%llu "
+			  "tag_max=%u tag_cur=%d\n",
 			  evt->ts_insert, evt->uid, current->pid, current->tgid, (void *)rq,
-			  evt->io_op, blk_rq_bytes(rq), rq->cmd_flags, evt->sector, evt->ioprio_class,
+			  blk_rq_bytes(rq), rq->cmd_flags, evt->sector, evt->ioprio_class,
 			  evt->file_ext, evt->file_ext_str, evt->is_front, evt->thread_role, evt->fs_type,
 			  evt->dev_name, evt->remap_from, evt->remap_mixed,
-			  evt->device_type, evt->is_sync, evt->inode_hash,
-			  evt->folio_index, evt->io_in_flight, evt->queue_saturate,
-			  nr_segment, tag, tag_depth_max, tag_depth_cur);
+			  evt->inode_hash,
+			  evt->folio_index, tag_depth_max, tag_depth_cur);
 }
 
 static void emit_raw_issue(const struct smart_io_event *evt,
 				    struct request *rq, bool new_record)
 {
 	u32 nr_bio = get_nr_bio(rq);
-	u32 nr_segment = get_nr_segment(rq);
-	int tag = get_rq_tag(rq);
 	u32 tag_depth_max = get_rq_tag_depth_max(rq);
 	int tag_depth_cur = get_rq_tag_depth_cur(rq);
 
+	if (evt->thread_role == ROLE_FIO) {
+		smart_io_raw_emit("block_rq_issue: "
+			  "ts_issue=%llu rq_p=%p thread_role=%u tag_max=%u tag_cur=%d\n",
+			  evt->ts_issue, (void *)rq, evt->thread_role, tag_depth_max, tag_depth_cur);
+		return;
+	}
+
 	if (new_record) {
 		smart_io_raw_emit("block_rq_issue: "
-				  "ts_issue=%llu uid=%u pid=%d tgid=%d rq_p=%p io_op=%u io_size=%u cmd=%u "
+				  "ts_issue=%llu uid=%u pid=%d tgid=%d rq_p=%p io_size=%u cmd=%u "
 				  "sector=%llu ioprio=%u file_ext=%u file_ext_s=%s fg=%u thread_role=%u "
-				  "fs_type=%s dev_name=%s remap_from=%s remap_mixed=%u dev_type=%u is_sync=%u "
-				  "inode_hash=%llu folio_index=%llu io_inflight=%u queue_sat=%u nr_bio=%u "
-				  "nr_segment=%u tag=%d tag_depth_max=%u tag_depth_cur=%d sched_lat_ns=0 direct=1\n",
+				  "fs_type=%s dev_name=%s remap_from=%s remap_mixed=%u "
+				  "inode_hash=%llu folio_index=%llu nr_bio=%u "
+				  "tag_max=%u tag_cur=%d direct=1\n",
 				  evt->ts_issue, evt->uid, current->pid, current->tgid,
-				  (void *)rq, evt->io_op, blk_rq_bytes(rq), rq->cmd_flags, evt->sector,
+				  (void *)rq, blk_rq_bytes(rq), rq->cmd_flags, evt->sector,
 				  evt->ioprio_class, evt->file_ext, evt->file_ext_str, evt->is_front,
 				  evt->thread_role, evt->fs_type, evt->dev_name, evt->remap_from,
-				  evt->remap_mixed, evt->device_type, evt->is_sync,
+				  evt->remap_mixed,
 				  evt->inode_hash, evt->folio_index, evt->io_in_flight,
-				  evt->queue_saturate, nr_bio, nr_segment, tag,
-				  tag_depth_max, tag_depth_cur);
+				  nr_bio, tag_depth_max, tag_depth_cur);
 		return;
 	}
 
 	smart_io_raw_emit("block_rq_issue: "
-			  "ts_issue=%llu uid=%u inode_hash=%llu rq_p=%p io_op=%u remap_from=%s remap_mixed=%u "
-			  "nr_bio=%u nr_segment=%u tag=%d tag_depth_max=%u tag_depth_cur=%d sched_lat_ns=%llu\n",
+			  "ts_issue=%llu uid=%u inode_hash=%llu rq_p=%p io_op=%u "
+			  "nr_bio=%u tag_max=%u tag_cur=%d sched_lat_ns=%llu\n",
 			  evt->ts_issue, evt->uid, evt->inode_hash, (void *)rq,
-			  evt->io_op, evt->remap_from, evt->remap_mixed, nr_bio,
-			  nr_segment, tag, tag_depth_max, tag_depth_cur, evt->ts_issue - evt->ts_insert);
+			  evt->io_op, nr_bio,
+			  tag_depth_max, tag_depth_cur, evt->ts_issue - evt->ts_insert);
 }
 
 static void emit_raw_requeue(const struct smart_io_event *evt,
 				      struct request *rq)
 {
 	u32 nr_bio = get_nr_bio(rq);
-	u32 nr_segment = get_nr_segment(rq);
-	int tag = get_rq_tag(rq);
 	u32 tag_depth_max = get_rq_tag_depth_max(rq);
 	int tag_depth_cur = get_rq_tag_depth_cur(rq);
 
+	if (evt->thread_role == ROLE_FIO) {
+		smart_io_raw_emit("block_rq_requeue: "
+			  "ts_requeue=%llu rq_p=%p tag_max=%u tag_cur=%d\n",
+			  ktime_get_boottime_ns(), (void *)rq, tag_depth_max, tag_depth_cur);
+		return;
+	}
+
 	smart_io_raw_emit("block_rq_requeue: "
-			  "ts_requeue=%llu uid=%u inode_hash=%llu rq_p=%p io_op=%u io_size=%u cmd=%u "
-			  "remap_from=%s remap_mixed=%u nr_bio=%u nr_segment=%u tag=%d "
-			  "tag_depth_max=%u tag_depth_cur=%d sched_lat_ns=%llu\n",
+			  "ts_requeue=%llu uid=%u inode_hash=%llu rq_p=%p io_size=%u cmd=%u nr_bio=%u "
+			  "tag_max=%u tag_cur=%d sched_lat_ns=%llu\n",
 			  ktime_get_boottime_ns(), evt->uid, evt->inode_hash,
-			  (void *)rq, evt->io_op, blk_rq_bytes(rq), rq->cmd_flags,
-			  evt->remap_from, evt->remap_mixed, nr_bio, nr_segment,
-			  tag, tag_depth_max, tag_depth_cur, evt->ts_requeue - evt->ts_insert);
+			  (void *)rq, blk_rq_bytes(rq), rq->cmd_flags,
+			  nr_bio, tag_depth_max, tag_depth_cur, evt->ts_requeue - evt->ts_insert);
 }
 
 static void emit_raw_complete(const struct smart_io_event *evt,
 				       struct request *rq,
 				       unsigned int nr_bytes)
 {
+	if (evt->thread_role == ROLE_FIO) {
+		smart_io_raw_emit("block_rq_complete: "
+			  "ts_complete=%llu rq_p=%p\n",
+			  evt->ts_complete, (void *)rq);
+		return;
+	}
 	smart_io_raw_emit("block_rq_complete: "
-			  "ts_complete=%llu uid=%u inode_hash=%llu rq_p=%p io_op=%u nr_bytes=%u remap_from=%s remap_mixed=%u sched_lat_ns=%llu dev_lat_ns=%llu\n",
+			  "ts_complete=%llu uid=%u inode_hash=%llu rq_p=%p io_op=%u nr_bytes=%u sched_lat_ns=%llu dev_lat_ns=%llu\n",
 			  evt->ts_complete, evt->uid, evt->inode_hash, (void *)rq,
-			  evt->io_op, nr_bytes, evt->remap_from, evt->remap_mixed, evt->ts_issue - evt->ts_insert, evt->ts_complete - evt->ts_issue);
+			  evt->io_op, nr_bytes, evt->ts_issue - evt->ts_insert, evt->ts_complete - evt->ts_issue);
 }
 
 static void fill_record_from_current(struct rq_record *rec, struct request *rq,
@@ -788,6 +785,9 @@ static void fill_record_from_current(struct rq_record *rec, struct request *rq,
 	evt->io_size_kb = blk_rq_bytes(rq) >> 10;
 	evt->sector = blk_rq_pos(rq);
 	evt->ioprio_class = req_get_ioprio(rq);
+
+	if (evt->thread_role == ROLE_FIO)
+		return;
 
 	extract_device_name(rq, evt->dev_name, sizeof(evt->dev_name));
 	apply_remap_info(evt, remap);
