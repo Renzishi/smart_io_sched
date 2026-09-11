@@ -18,16 +18,20 @@
 #include "io_semantics.h"
 #include "smart_io_log.h"
 #include "smart_io_types.h"
+#include "system_context.h"
 #include "tp_filemap.h"
 #include "trace_instance.h"
 
-// struct filemap_fault_rec {
-// 	struct file *file;
-// 	pgoff_t index;
-// 	u64 start_ts;
-// };
+#define FILEMAP_PGF_TASK_HASH_BITS 6
 
-// static DEFINE_PER_CPU(struct filemap_fault_rec, filemap_fault_state);
+struct filemap_pgf_task {
+	struct hlist_node node;
+	struct task_struct *task;
+	u32 depth;
+};
+
+static DEFINE_HASHTABLE(filemap_pgf_task_hash, FILEMAP_PGF_TASK_HASH_BITS);
+static DEFINE_SPINLOCK(filemap_pgf_task_lock);
 
 #define FILEMAP_AGG_HASH_BITS 8
 #define FILEMAP_AGG_MAX_ENTRIES 1024
@@ -291,49 +295,129 @@ static void tp_filemap_refault_cb(void *ignore, struct folio *folio)
 	smart_io_record_filemap_refault(pages);
 }
 
-// static void tp_filemap_fault_start_cb(void *ignore, struct vm_fault *vmf)
-// {
-// 	struct filemap_fault_rec *rec;
+static struct filemap_pgf_task *filemap_pgf_find_locked(
+		struct task_struct *task)
+{
+	struct filemap_pgf_task *entry;
 
-// 	(void)ignore;
-// 	if (!vmf)
-// 		return;
-// 	rec = this_cpu_ptr(&filemap_fault_state);
-// 	rec->file = vmf->vma ? vmf->vma->vm_file : NULL;
-// 	rec->index = vmf->pgoff;
-// 	rec->start_ts = ktime_get_boottime_ns();
-// 	filemap_emit_raw("filemap_fault_start", NULL, NULL, rec->file,
-// 			 rec->index, rec->index, 1, 0);
-// }
+	hash_for_each_possible(filemap_pgf_task_hash, entry, node,
+			       (unsigned long)task) {
+		if (entry->task == task)
+			return entry;
+	}
+	return NULL;
+}
 
-// static void tp_filemap_fault_end_cb(void *ignore, struct vm_fault *vmf)
-// {
-// 	struct filemap_fault_rec *rec;
-// 	struct file *file = NULL;
-// 	pgoff_t index = 0;
-// 	u64 now;
-// 	u64 wait_us = 0;
+static void tp_filemap_fault_start_cb(void *ignore, struct file *file,
+					      pgoff_t pgoff)
+{
+	struct filemap_pgf_task *entry;
+	struct filemap_pgf_task *existing;
+	unsigned long flags;
 
-// 	(void)ignore;
-// 	now = ktime_get_boottime_ns();
-// 	rec = this_cpu_ptr(&filemap_fault_state);
-// 	if (vmf) {
-// 		file = vmf->vma ? vmf->vma->vm_file : NULL;
-// 		index = vmf->pgoff;
-// 	}
-// 	if (!file) {
-// 		file = rec->file;
-// 		index = rec->index;
-// 	}
-// 	if (rec->start_ts && now > rec->start_ts)
-// 		wait_us = div64_u64(now - rec->start_ts, 1000);
-// 	filemap_emit_raw("filemap_fault_end", NULL, NULL, file, index, index, 1,
-// 			 wait_us);
-// 	smart_io_record_filemap_fault(wait_us);
-// 	rec->file = NULL;
-// 	rec->index = 0;
-// 	rec->start_ts = 0;
-// }
+	(void)ignore;
+	(void)file;
+	(void)pgoff;
+
+	if (current->pid != smart_io_get_fg_main_pid())
+		return;
+
+	spin_lock_irqsave(&filemap_pgf_task_lock, flags);
+	entry = filemap_pgf_find_locked(current);
+	if (entry) {
+		entry->depth++;
+		spin_unlock_irqrestore(&filemap_pgf_task_lock, flags);
+		return;
+	}
+	spin_unlock_irqrestore(&filemap_pgf_task_lock, flags);
+
+	entry = kzalloc(sizeof(*entry), GFP_ATOMIC);
+	if (!entry)
+		return;
+	entry->task = current;
+	entry->depth = 1;
+	get_task_struct(entry->task);
+
+	spin_lock_irqsave(&filemap_pgf_task_lock, flags);
+	existing = filemap_pgf_find_locked(current);
+	if (existing) {
+		existing->depth++;
+		spin_unlock_irqrestore(&filemap_pgf_task_lock, flags);
+		put_task_struct(entry->task);
+		kfree(entry);
+		return;
+	}
+	hash_add(filemap_pgf_task_hash, &entry->node, (unsigned long)current);
+	spin_unlock_irqrestore(&filemap_pgf_task_lock, flags);
+}
+
+static void tp_filemap_fault_end_cb(void *ignore, struct file *file,
+					    pgoff_t pgoff)
+{
+	struct filemap_pgf_task *entry;
+	unsigned long flags;
+	bool release = false;
+
+	(void)ignore;
+	(void)file;
+	(void)pgoff;
+
+	spin_lock_irqsave(&filemap_pgf_task_lock, flags);
+	entry = filemap_pgf_find_locked(current);
+	if (entry) {
+		if (entry->depth > 1) {
+			entry->depth--;
+		} else {
+			hash_del(&entry->node);
+			release = true;
+		}
+	}
+	spin_unlock_irqrestore(&filemap_pgf_task_lock, flags);
+
+	if (release) {
+		put_task_struct(entry->task);
+		kfree(entry);
+	}
+}
+
+bool smart_io_filemap_fault_active(void)
+{
+	struct filemap_pgf_task *entry;
+	unsigned long flags;
+	bool active;
+
+	if (current->pid != smart_io_get_fg_main_pid())
+		return false;
+
+	spin_lock_irqsave(&filemap_pgf_task_lock, flags);
+	entry = filemap_pgf_find_locked(current);
+	active = entry != NULL;
+	spin_unlock_irqrestore(&filemap_pgf_task_lock, flags);
+
+	return active;
+}
+
+static void smart_io_filemap_pgf_clear(void)
+{
+	HLIST_HEAD(flush_list);
+	struct filemap_pgf_task *entry;
+	struct hlist_node *tmp;
+	unsigned long flags;
+	int bucket;
+
+	spin_lock_irqsave(&filemap_pgf_task_lock, flags);
+	hash_for_each_safe(filemap_pgf_task_hash, bucket, tmp, entry, node) {
+		hash_del(&entry->node);
+		hlist_add_head(&entry->node, &flush_list);
+	}
+	spin_unlock_irqrestore(&filemap_pgf_task_lock, flags);
+
+	hlist_for_each_entry_safe(entry, tmp, &flush_list, node) {
+		hlist_del(&entry->node);
+		put_task_struct(entry->task);
+		kfree(entry);
+	}
+}
 
 void smart_io_filemap_agg_flush(void)
 {
@@ -428,6 +512,68 @@ void unregister_filemap_tracepoints(void)
 	smart_io_filemap_agg_flush();
 	kmem_cache_destroy(filemap_agg_cache);
 	filemap_agg_cache = NULL;
+}
+
+static struct filemap_tracepoint_entry filemap_fault_tps[] = {
+	{ .name = "android_vh_filemap_fault_start", .func = tp_filemap_fault_start_cb, .required = true },
+	{ .name = "android_vh_filemap_fault_end", .func = tp_filemap_fault_end_cb, .required = true },
+};
+
+#define FOR_EACH_FILEMAP_FAULT_TP(i) \
+	for (i = 0; i < ARRAY_SIZE(filemap_fault_tps); i++)
+
+static void lookup_filemap_fault_tracepoints(struct tracepoint *tp,
+						      void *ignore)
+{
+	int i;
+
+	(void)ignore;
+	FOR_EACH_FILEMAP_FAULT_TP(i) {
+		if (!strcmp(filemap_fault_tps[i].name, tp->name))
+			filemap_fault_tps[i].tp = tp;
+	}
+}
+
+void unregister_filemap_fault_tracepoints(void)
+{
+	int i;
+
+	FOR_EACH_FILEMAP_FAULT_TP(i) {
+		if (filemap_fault_tps[i].init) {
+			tracepoint_probe_unregister(filemap_fault_tps[i].tp,
+						filemap_fault_tps[i].func, NULL);
+			filemap_fault_tps[i].init = false;
+		}
+	}
+	tracepoint_synchronize_unregister();
+	smart_io_filemap_pgf_clear();
+}
+
+int register_filemap_fault_tracepoints(void)
+{
+	int i;
+	int ret;
+
+	for_each_kernel_tracepoint(lookup_filemap_fault_tracepoints, NULL);
+	FOR_EACH_FILEMAP_FAULT_TP(i) {
+		if (!filemap_fault_tps[i].tp) {
+			smart_io_log_warn("tracepoint %s not found, PGF disabled.\n",
+					  filemap_fault_tps[i].name);
+			unregister_filemap_fault_tracepoints();
+			return -ENOENT;
+		}
+		ret = tracepoint_probe_register(filemap_fault_tps[i].tp,
+						filemap_fault_tps[i].func, NULL);
+		if (ret) {
+			smart_io_log_warn("failed to register %s, PGF disabled: %d.\n",
+					  filemap_fault_tps[i].name, ret);
+			unregister_filemap_fault_tracepoints();
+			return ret;
+		}
+		filemap_fault_tps[i].init = true;
+	}
+	smart_io_log_info("filemap fault tracepoints registered.\n");
+	return 0;
 }
 
 int register_filemap_tracepoints(void)

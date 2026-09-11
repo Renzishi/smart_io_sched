@@ -2,7 +2,6 @@
 #include <linux/kernel.h>
 #include <linux/ktime.h>
 #include <linux/sched.h>
-#include <linux/smp.h>
 #include <linux/string.h>
 #include <linux/tracepoint.h>
 
@@ -35,39 +34,40 @@ static void tp_sched_switch_cb(void *ignore, bool preempt,
 
 	if (!prev || !next)
 		return;
-	if (!fg_main_pid_matches(prev->pid) && !fg_main_pid_matches(next->pid))
+	/* Only log when the fg main thread gives up the cpu because of a
+	 * blocking state (S/D); preemption (prev_state == RUNNING) is skipped.
+	 */
+	if (!fg_main_pid_matches(prev->pid))
+		return;
+	if (!(prev_state & (TASK_INTERRUPTIBLE | TASK_UNINTERRUPTIBLE)))
 		return;
 
 	prev_state_enum = smart_io_task_state_to_enum(prev_state);
 
 	smart_io_raw_emit("sched_switch: ts=%llu "
-		"prev_pid=%d prev_comm=%s prev_state=%u prev_state_s=%s "
-		"next_pid=%d next_comm=%s next_state=%u next_state_s=%s cpu=%d\n",
+		"p_pid=%d p_comm=%s p_state=%u p_state_s=%s "
+		"n_pid=%d n_comm=%s n_state=%u n_state_s=%s\n",
 			  ktime_get_boottime_ns(), prev->pid, prev->comm,
 			  prev_state_enum, smart_io_task_state_to_str(prev_state_enum),
 			  next->pid, next->comm, SMART_IO_TASK_RUNNING,
-			  smart_io_task_state_to_str(SMART_IO_TASK_RUNNING),
-			  raw_smp_processor_id());
+			  smart_io_task_state_to_str(SMART_IO_TASK_RUNNING));
 }
 
 static void tp_sched_wakeup_cb(void *ignore, struct task_struct *task)
 {
-	u32 state_enum;
-	unsigned long raw_state = 0;
-
 	(void)ignore;
 
+	/* task is the woken fg main thread; current is the waker context.
+	 * (The kernel only passes the woken task to sched_wakeup; current is
+	 * the best approximation of the waker. It equals task on self-wakeup.)
+	 */
 	if (!task || !fg_main_pid_matches(task->pid))
 		return;
 
-	raw_state = READ_ONCE(task->__state);
-	state_enum = smart_io_task_state_to_enum(raw_state);
 	smart_io_raw_emit("sched_wakeup: ts=%llu "
-		"pid=%d comm=%s target_cpu=%d "
-		"state=%u state_s=%s raw_state=%lu\n",
-			  ktime_get_boottime_ns(), task->pid, task->comm,
-			  task_cpu(task), state_enum,
-			  smart_io_task_state_to_str(state_enum), raw_state);
+		"p_pid=%d p_comm=%s n_pid=%d n_comm=%s\n",
+			  ktime_get_boottime_ns(), current->pid, current->comm,
+			  task->pid, task->comm);
 }
 
 struct sched_tracepoint_entry {

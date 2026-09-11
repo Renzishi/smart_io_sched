@@ -36,7 +36,7 @@
 #define REMAP_HASH_BITS 10
 #define HIST_BUCKETS 21
 #define HOT_INODE_MAX 64
-#define HOT_INODE_TTL_NS (500ULL * 1000ULL * 1000ULL)
+#define HOT_INODE_TTL_NS (1ULL * 1000ULL * 1000ULL * 1000ULL)
 #define DEFAULT_QUEUE_DEPTH 128
 #define SMART_IO_TICK_MS 100U
 #define DEFAULT_BLK_MAX_BW_KBPS (800U * 1024U)
@@ -520,7 +520,8 @@ static bool smart_io_is_hot_read_candidate(const struct smart_io_event *event)
 	    event->file_ext != SMART_IO_FILE_EXT_VDEX)
 		return false;
 
-	return event->is_front;
+	return event->is_front &&
+		current->pid == smart_io_get_fg_main_pid();
 }
 
 static u8 snapshot_device_util(void)

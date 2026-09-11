@@ -78,6 +78,7 @@ struct dd_per_prio {
 	struct list_head dispatch;
 	struct rb_root sort_list[DD_DIR_COUNT];
 	struct list_head fifo_list[DD_DIR_COUNT];
+	struct request *vip_tail[DD_DIR_COUNT];
 	/* Position of the most recently dispatched request. */
 	sector_t latest_pos[DD_DIR_COUNT];
 	struct io_stats_per_prio stats;
@@ -178,6 +179,14 @@ static void deadline_remove_request(struct request_queue *q,
 				    struct dd_per_prio *per_prio,
 				    struct request *rq)
 {
+	enum dd_data_dir data_dir = rq_data_dir(rq);
+
+	if (per_prio->vip_tail[data_dir] == rq) {
+		per_prio->vip_tail[data_dir] =
+		rq->queuelist.prev == &per_prio->fifo_list[data_dir] ?
+			NULL : list_entry(rq->queuelist.prev, struct request,
+					  queuelist);
+	}
 	list_del_init(&rq->queuelist);
 
 	/*
@@ -218,6 +227,7 @@ static void dd_merged_requests(struct request_queue *q, struct request *req,
 	struct deadline_data *dd = q->elevator->elevator_data;
 	const enum dd_prio prio = (enum dd_prio)
 		smart_io_throttle_select_queue(next);
+	struct dd_per_prio *per_prio = &dd->per_prio[prio];
 
 	lockdep_assert_held(&dd->lock);
 
@@ -232,6 +242,8 @@ static void dd_merged_requests(struct request_queue *q, struct request *req,
 	if (!list_empty(&req->queuelist) && !list_empty(&next->queuelist)) {
 		if (time_before((unsigned long)next->fifo_time,
 				(unsigned long)req->fifo_time)) {
+			if (per_prio->vip_tail[rq_data_dir(next)] == next)
+				per_prio->vip_tail[rq_data_dir(next)] = req;
 			list_move(&req->queuelist, &next->queuelist);
 			req->fifo_time = next->fifo_time;
 		}
@@ -797,23 +809,56 @@ static struct request *dd_dispatch_fifo(struct deadline_data *dd,
 	struct request *rq;
 	struct request *read_rq;
 	struct request *write_rq;
+	struct request *vip_read_rq;
+	struct request *vip_write_rq;
+	u64 vip_read_id;
+	u64 vip_write_id;
 
 	if (!list_empty(&per_prio->dispatch)) {
 		rq = list_first_entry(&per_prio->dispatch, struct request,
 					queuelist);
 	} else {
-		read_rq = list_first_entry_or_null(&per_prio->fifo_list[DD_READ],
-							struct request, queuelist);
-		write_rq = list_first_entry_or_null(&per_prio->fifo_list[DD_WRITE],
-							struct request, queuelist);
-		if (!read_rq)
-			rq = write_rq;
-		else if (!write_rq)
-			rq = read_rq;
-		else
-			rq = time_before((unsigned long)read_rq->fifo_time,
-					 (unsigned long)write_rq->fifo_time) ?
-				read_rq : write_rq;
+		vip_read_rq = list_first_entry_or_null(
+			&per_prio->fifo_list[DD_READ], struct request, queuelist);
+		if (vip_read_rq &&
+		    !smart_io_throttle_request_is_vip(vip_read_rq))
+			vip_read_rq = NULL;
+		vip_write_rq = list_first_entry_or_null(
+			&per_prio->fifo_list[DD_WRITE], struct request, queuelist);
+		if (vip_write_rq &&
+		    !smart_io_throttle_request_is_vip(vip_write_rq))
+			vip_write_rq = NULL;
+		if (vip_read_rq || vip_write_rq) {
+			if (!vip_read_rq)
+				rq = vip_write_rq;
+			else if (!vip_write_rq)
+				rq = vip_read_rq;
+			else {
+				vip_read_id = smart_io_throttle_request_id(vip_read_rq);
+				vip_write_id = smart_io_throttle_request_id(vip_write_rq);
+				rq = vip_read_id && vip_write_id ?
+					vip_read_id < vip_write_id ? vip_read_rq :
+					vip_write_rq :
+					time_before((unsigned long)vip_read_rq->fifo_time,
+						    (unsigned long)vip_write_rq->fifo_time) ?
+					vip_read_rq : vip_write_rq;
+			}
+		} else {
+			read_rq = list_first_entry_or_null(
+				&per_prio->fifo_list[DD_READ], struct request,
+				queuelist);
+			write_rq = list_first_entry_or_null(
+				&per_prio->fifo_list[DD_WRITE], struct request,
+				queuelist);
+			if (!read_rq)
+				rq = write_rq;
+			else if (!write_rq)
+				rq = read_rq;
+			else
+				rq = time_before((unsigned long)read_rq->fifo_time,
+						 (unsigned long)write_rq->fifo_time) ?
+					read_rq : write_rq;
+		}
 	}
 	if (!rq)
 		return NULL;
@@ -822,6 +867,26 @@ static struct request *dd_dispatch_fifo(struct deadline_data *dd,
 	per_prio->stats.dispatched++;
 	rq->rq_flags |= RQF_STARTED;
 	return rq;
+}
+
+static void dd_insert_fifo_request(struct dd_per_prio *per_prio,
+					   struct request *rq,
+					   enum dd_data_dir data_dir)
+{
+	struct list_head *head = &per_prio->fifo_list[data_dir];
+
+	if (!smart_io_throttle_request_is_vip(rq)) {
+		list_add_tail(&rq->queuelist, head);
+		return;
+	}
+
+	/* Keep VIP requests ahead of regular HP requests and FIFO within VIP. */
+	if (per_prio->vip_tail[data_dir])
+		list_add(&rq->queuelist,
+			 &per_prio->vip_tail[data_dir]->queuelist);
+	else
+		list_add(&rq->queuelist, head);
+	per_prio->vip_tail[data_dir] = rq;
 }
 
 static struct request *dd_dispatch_request(struct blk_mq_hw_ctx *hctx)
@@ -1065,8 +1130,6 @@ static void dd_insert_request(struct blk_mq_hw_ctx *hctx, struct request *rq,
 		list_add(&rq->queuelist, &per_prio->dispatch);
 		rq->fifo_time = jiffies;
 	} else {
-		struct list_head *insert_before;
-
 		deadline_add_rq_rb(per_prio, rq);
 
 		if (rq_mergeable(rq)) {
@@ -1080,8 +1143,7 @@ static void dd_insert_request(struct blk_mq_hw_ctx *hctx, struct request *rq,
 		 */
 		/* Keep arrival time for FIFO ordering; deadline expiry is disabled. */
 		rq->fifo_time = jiffies;
-		insert_before = &per_prio->fifo_list[data_dir];
-		list_add_tail(&rq->queuelist, insert_before);
+		dd_insert_fifo_request(per_prio, rq, data_dir);
 	}
 }
 

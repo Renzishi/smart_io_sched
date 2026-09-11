@@ -36,8 +36,18 @@ int smart_io_tp_init(void)
 		return ret;
 	}
 
+	ret = register_filemap_fault_tracepoints();
+	if (ret) {
+		unregister_psi_tracepoints();
+		unregister_f2fs_tracepoints();
+		unregister_block_tracepoints();
+		smart_io_log_err("failed to register filemap tracepoints: %d\n", ret);
+		return ret;
+	}
+
 	ret = register_pagecache_demo();
 	if (ret) {
+		unregister_filemap_fault_tracepoints();
 		unregister_psi_tracepoints();
 		unregister_f2fs_tracepoints();
 		unregister_block_tracepoints();
@@ -54,16 +64,16 @@ int smart_io_tp_init(void)
 	// 	return ret;
 	// }
 
-	// ret = register_sched_tracepoints();
-	// if (ret) {
-	// 	unregister_binder_tracepoints();
-	// 	unregister_filemap_tracepoints();
-	// 	unregister_psi_tracepoints();
-	// 	unregister_f2fs_tracepoints();
-	// 	unregister_block_tracepoints();
-	// 	smart_io_log_err("sched tracepoints unavailable: %d\n", ret);
-	// 	return ret;
-	// }
+	ret = register_sched_tracepoints();
+	if (ret) {
+		unregister_pagecache_demo();
+		unregister_filemap_fault_tracepoints();
+		unregister_psi_tracepoints();
+		unregister_f2fs_tracepoints();
+		unregister_block_tracepoints();
+		smart_io_log_err("sched tracepoints unavailable: %d\n", ret);
+		return ret;
+	}
 
 	smart_io_log_info("tracepoints registered.\n");
 	return 0;
@@ -71,9 +81,10 @@ int smart_io_tp_init(void)
 
 void smart_io_tp_exit(void)
 {
-	// unregister_sched_tracepoints();
+	unregister_sched_tracepoints();
 	// unregister_binder_tracepoints();
 	unregister_pagecache_demo();
+	unregister_filemap_fault_tracepoints();
 	unregister_psi_tracepoints();
 	unregister_f2fs_tracepoints();
 	unregister_block_tracepoints();

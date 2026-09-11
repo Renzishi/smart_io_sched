@@ -19,11 +19,8 @@
 #include "trace_instance.h"
 #include "tp_pagecache_demo.h"
 
-#define PAGECACHE_DEMO_WINDOW_NS (50ULL * 1000ULL * 1000ULL)
-#define PAGECACHE_DEMO_BUDGET_BYTES (256U * 1024U)
-#define PAGECACHE_DEMO_BUDGET_WINDOW_COUNT 10U
-#define PAGECACHE_DEMO_BUDGET_WINDOW_NS \
-	(PAGECACHE_DEMO_WINDOW_NS * PAGECACHE_DEMO_BUDGET_WINDOW_COUNT)
+#define PAGECACHE_DEMO_BUDGET_BYTES (1U * 1024U * 1024U)
+#define PAGECACHE_DEMO_BUDGET_WINDOW_NS (1ULL * 1000ULL * 1000ULL * 1000ULL)
 #define PAGECACHE_DEMO_BUDGET_INODES 64U
 #define PAGECACHE_DEMO_LOG_BUDGET 64U
 #define PAGECACHE_DEMO_OBS_LOG_BUDGET 256U
@@ -389,7 +386,7 @@ static void tp_pagecache_demo_shrink_cb(void *ignore, struct folio *folio,
 	if (log_action && atomic_read(&rawdata_trace_enabled))
 		smart_io_raw_emit("pc_activate: ts=%llu inode_hash=%llu "
 				  "file_ext=%u index=%llu pages=%u budget_pages=%u "
-				  "ttl_ms=500\n",
+				  "ttl_ms=1000\n",
 				 now, inode_hash, file_ext, (u64)folio->index,
 				 (u32)min_t(unsigned long, folio_nr_pages(folio), U32_MAX),
 				 PAGECACHE_DEMO_BUDGET_BYTES >> PAGE_SHIFT);

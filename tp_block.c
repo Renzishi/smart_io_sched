@@ -1,3 +1,4 @@
+#include <linux/bio.h>
 #include <linux/tracepoint.h>
 #include <trace/events/block.h>
 #include <linux/string.h>
@@ -6,6 +7,7 @@
 #include "smart_io_log.h"
 #include "smart_io_throttle.h"
 #include "smart_io_types.h"
+#include "tp_filemap.h"
 #include "trace_instance.h"
 
 static void tp_rq_insert_cb(void *ignore, struct request *rq)
@@ -15,7 +17,14 @@ static void tp_rq_insert_cb(void *ignore, struct request *rq)
 
 static void tp_bio_queue_cb(void *ignore, struct bio *bio)
 {
-	smart_io_throttle_mark_bio_hp(bio);
+	if (!bio || bio_op(bio) != REQ_OP_READ)
+		return;
+
+	if (smart_io_filemap_fault_active())
+		smart_io_throttle_mark_bio_pgf(bio);
+	else
+		smart_io_throttle_mark_bio_hp(bio);
+	smart_io_throttle_mark_bio_vip(bio);
 }
 
 static void tp_rq_issue_cb(void *ignore, struct request *rq)

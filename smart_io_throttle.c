@@ -164,16 +164,61 @@ static bool smart_io_throttle_device_time_excluded(const struct request *rq,
 	return !strncmp(dev_name, "loop", 4);
 }
 
-#define SMART_IO_HP_IOPRIO_HINT IOPRIO_HINT_MASK
+#define SMART_IO_HP_IOPRIO_HINT (1U << 3)
+#define SMART_IO_PGF_IOPRIO_HINT (1U << 4)
+#define SMART_IO_PI_IOPRIO_HINT (1U << 5)
+#define SMART_IO_VIP_IOPRIO_HINT (1U << 6)
+#define SMART_IO_PRIVATE_HINT_MASK \
+	(SMART_IO_HP_IOPRIO_HINT | SMART_IO_PGF_IOPRIO_HINT | \
+	 SMART_IO_PI_IOPRIO_HINT | SMART_IO_VIP_IOPRIO_HINT)
 
 static bool smart_io_throttle_is_hp_ioprio(u16 ioprio)
 {
-	return IOPRIO_PRIO_HINT(ioprio) == SMART_IO_HP_IOPRIO_HINT;
+	return IOPRIO_PRIO_HINT(ioprio) & SMART_IO_HP_IOPRIO_HINT;
 }
 
-static u16 smart_io_throttle_add_hp_hint(u16 ioprio)
+static bool smart_io_throttle_is_vip_ioprio(u16 ioprio)
+{
+	return IOPRIO_PRIO_HINT(ioprio) & SMART_IO_VIP_IOPRIO_HINT;
+}
+
+static bool smart_io_throttle_is_smart_ioprio(u16 ioprio)
+{
+	u16 hint = IOPRIO_PRIO_HINT(ioprio);
+
+	return hint & SMART_IO_PRIVATE_HINT_MASK;
+}
+
+bool smart_io_throttle_request_is_vip(const struct request *rq)
+{
+	return rq && req_op((struct request *)rq) == REQ_OP_READ &&
+		smart_io_throttle_is_vip_ioprio(
+			req_get_ioprio((struct request *)rq));
+}
+
+u64 smart_io_throttle_request_id(const struct request *rq)
+{
+	struct smart_io_rq_meta *meta;
+
+	if (!rq)
+		return 0;
+	meta = smart_io_throttle_rq_meta(rq);
+	return meta ? READ_ONCE(meta->rq_id) : 0;
+}
+
+static bool smart_io_throttle_is_official_hint(u16 hint)
+{
+	return hint >= IOPRIO_HINT_DEV_DURATION_LIMIT_1 &&
+		hint <= IOPRIO_HINT_DEV_DURATION_LIMIT_7;
+}
+
+static u16 smart_io_throttle_set_private_hint(u16 ioprio, u16 hint)
 {
 	u8 ioprio_class = IOPRIO_PRIO_CLASS(ioprio);
+	u16 old_hint = IOPRIO_PRIO_HINT(ioprio);
+
+	if (smart_io_throttle_is_official_hint(old_hint))
+		return ioprio;
 
 	if (ioprio_class > IOPRIO_CLASS_IDLE)
 		return ioprio;
@@ -183,7 +228,19 @@ static u16 smart_io_throttle_add_hp_hint(u16 ioprio)
 	}
 
 	return IOPRIO_PRIO_VALUE_HINT(ioprio_class,
-		IOPRIO_PRIO_LEVEL(ioprio), SMART_IO_HP_IOPRIO_HINT);
+		IOPRIO_PRIO_LEVEL(ioprio), old_hint | hint);
+}
+
+static u16 smart_io_throttle_add_hp_hint(u16 ioprio)
+{
+	return smart_io_throttle_set_private_hint(ioprio,
+		SMART_IO_HP_IOPRIO_HINT);
+}
+
+static u16 smart_io_throttle_add_pgf_hint(u16 ioprio)
+{
+	return smart_io_throttle_set_private_hint(ioprio,
+		SMART_IO_PGF_IOPRIO_HINT);
 }
 
 static enum smart_io_queue_class
@@ -199,6 +256,16 @@ static bool smart_io_throttle_current_uid_is_fg(void)
 	u32 uid = from_kuid(&init_user_ns, current_uid());
 
 	return fg_uid >= 0 && uid == (u32)fg_uid;
+}
+
+static bool smart_io_throttle_current_can_mark_vip(void)
+{
+	if (!smart_io_throttle_current_uid_is_fg())
+		return false;
+
+	return current->pid == smart_io_get_fg_main_pid() ||
+		strstr(current->comm, "RenderThread") ||
+		strstr(current->comm, "GLThread");
 }
 
 static bool smart_io_throttle_current_can_mark_hp(void)
@@ -225,13 +292,23 @@ enum smart_io_queue_class
 smart_io_throttle_select_queue(const struct request *rq)
 {
 	struct smart_io_rq_meta *meta;
+	u16 ioprio;
+	unsigned int op;
 
 	if (rq) {
 		meta = smart_io_throttle_rq_meta(rq);
 		if (meta)
 			return meta->queue_class;
+		ioprio = req_get_ioprio((struct request *)rq);
+		op = req_op((struct request *)rq);
+		if (op_is_write(op))
+			return smart_io_throttle_is_smart_ioprio(ioprio) ?
+				SMART_IO_QUEUE_RT : SMART_IO_QUEUE_BE;
 	}
 	if (rq && smart_io_throttle_is_hp_ioprio(req_get_ioprio((struct request *)rq)))
+		return SMART_IO_QUEUE_HP;
+	if (rq && smart_io_throttle_is_smart_ioprio(
+			req_get_ioprio((struct request *)rq)))
 		return SMART_IO_QUEUE_HP;
 	if (rq && (smart_io_throttle_current_can_mark_hp() ||
 		   smart_io_throttle_rt_read_can_mark_hp(req_get_ioprio((struct request *)rq),
@@ -247,7 +324,10 @@ smart_io_throttle_select_bio_queue(const struct bio *bio)
 {
 	if (!bio)
 		return SMART_IO_QUEUE_BE;
-	if (smart_io_throttle_is_hp_ioprio(bio->bi_ioprio))
+	if (op_is_write(bio_op(bio)))
+		return smart_io_throttle_is_smart_ioprio(bio->bi_ioprio) ?
+			SMART_IO_QUEUE_RT : SMART_IO_QUEUE_BE;
+	if (smart_io_throttle_is_smart_ioprio(bio->bi_ioprio))
 		return SMART_IO_QUEUE_HP;
 	if (smart_io_throttle_current_can_mark_hp() ||
 	    smart_io_throttle_rt_read_can_mark_hp(bio->bi_ioprio, bio_op(bio)))
@@ -258,7 +338,8 @@ smart_io_throttle_select_bio_queue(const struct bio *bio)
 
 void smart_io_throttle_mark_bio_hp(struct bio *bio)
 {
-	if (!bio || !(smart_io_throttle_current_can_mark_hp() ||
+	if (!bio || bio_op(bio) != REQ_OP_READ ||
+	    !(smart_io_throttle_current_can_mark_hp() ||
 		      smart_io_throttle_rt_read_can_mark_hp(bio->bi_ioprio,
 								 bio_op(bio))))
 		return;
@@ -266,9 +347,27 @@ void smart_io_throttle_mark_bio_hp(struct bio *bio)
 	bio->bi_ioprio = smart_io_throttle_add_hp_hint(bio->bi_ioprio);
 }
 
+void smart_io_throttle_mark_bio_vip(struct bio *bio)
+{
+	if (!bio || bio_op(bio) != REQ_OP_READ ||
+	    !smart_io_throttle_current_can_mark_vip())
+		return;
+
+	bio->bi_ioprio = smart_io_throttle_set_private_hint(
+		bio->bi_ioprio, SMART_IO_VIP_IOPRIO_HINT);
+}
+
+void smart_io_throttle_mark_bio_pgf(struct bio *bio)
+{
+	if (!bio || bio_op(bio) != REQ_OP_READ)
+		return;
+
+	bio->bi_ioprio = smart_io_throttle_add_pgf_hint(bio->bi_ioprio);
+}
+
 void smart_io_throttle_mark_request_hp(struct request *rq)
 {
-	if (!rq || smart_io_throttle_is_hp_ioprio(req_get_ioprio(rq)))
+	if (!rq || smart_io_throttle_is_smart_ioprio(req_get_ioprio(rq)))
 		return;
 
 	rq->ioprio = smart_io_throttle_add_hp_hint(req_get_ioprio(rq));
