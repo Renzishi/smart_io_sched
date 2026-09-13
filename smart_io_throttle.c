@@ -26,6 +26,7 @@
 #include "block_helper.h"
 #include "smart_io_throttle.h"
 #include "system_context.h"
+#include "tp_pi.h"
 #include "trace_instance.h"
 
 // #define SMART_IO_DEFAULT_DEV_LAT_US 4000U
@@ -179,7 +180,9 @@ static bool smart_io_throttle_is_hp_ioprio(u16 ioprio)
 
 static bool smart_io_throttle_is_vip_ioprio(u16 ioprio)
 {
-	return IOPRIO_PRIO_HINT(ioprio) & SMART_IO_VIP_IOPRIO_HINT;
+	return IOPRIO_PRIO_HINT(ioprio) &
+		(SMART_IO_PGF_IOPRIO_HINT | SMART_IO_PI_IOPRIO_HINT |
+		 SMART_IO_VIP_IOPRIO_HINT);
 }
 
 static bool smart_io_throttle_is_smart_ioprio(u16 ioprio)
@@ -258,7 +261,7 @@ static bool smart_io_throttle_current_uid_is_fg(void)
 	return fg_uid >= 0 && uid == (u32)fg_uid;
 }
 
-static bool smart_io_throttle_current_can_mark_vip(void)
+static bool smart_io_throttle_current_is_ux(void)
 {
 	if (!smart_io_throttle_current_uid_is_fg())
 		return false;
@@ -268,24 +271,30 @@ static bool smart_io_throttle_current_can_mark_vip(void)
 		strstr(current->comm, "GLThread");
 }
 
-static bool smart_io_throttle_current_can_mark_hp(void)
+static bool smart_io_throttle_special_read(u16 ioprio, blk_opf_t opf,
+					   unsigned int op)
 {
-	if (!smart_io_throttle_current_uid_is_fg())
-		return false;
-	if (!atomic_read(&ux_hp_enabled))
-		return true;
-
-	return current->pid == smart_io_get_fg_main_pid() ||
-		strstr(current->comm, "RenderThread") ||
-		strstr(current->comm, "GLThread");
+	return op == REQ_OP_READ &&
+		(IOPRIO_PRIO_CLASS(ioprio) == IOPRIO_CLASS_RT ||
+		 (opf & (REQ_PRIO | REQ_META | REQ_SYNC)));
 }
 
-static bool smart_io_throttle_rt_read_can_mark_hp(u16 ioprio,
+static bool smart_io_throttle_current_can_mark_hp(u16 ioprio,
+						  blk_opf_t opf, unsigned int op)
+{
+	if (!smart_io_throttle_current_uid_is_fg() || op != REQ_OP_READ)
+		return false;
+
+	return smart_io_throttle_current_is_ux() ||
+		smart_io_throttle_special_read(ioprio, opf, op);
+}
+
+static bool smart_io_throttle_current_can_mark_vip(u16 ioprio,
+						   blk_opf_t opf,
 						   unsigned int op)
 {
-	return atomic_read(&rt_read_hp_enabled) &&
-		IOPRIO_PRIO_CLASS(ioprio) == IOPRIO_CLASS_RT &&
-		op == REQ_OP_READ;
+	return smart_io_throttle_current_is_ux() &&
+		smart_io_throttle_special_read(ioprio, opf, op);
 }
 
 enum smart_io_queue_class
@@ -310,9 +319,9 @@ smart_io_throttle_select_queue(const struct request *rq)
 	if (rq && smart_io_throttle_is_smart_ioprio(
 			req_get_ioprio((struct request *)rq)))
 		return SMART_IO_QUEUE_HP;
-	if (rq && (smart_io_throttle_current_can_mark_hp() ||
-		   smart_io_throttle_rt_read_can_mark_hp(req_get_ioprio((struct request *)rq),
-							       req_op((struct request *)rq))))
+	if (rq && smart_io_throttle_current_can_mark_hp(
+			req_get_ioprio((struct request *)rq),
+			((struct request *)rq)->cmd_flags, op))
 		return SMART_IO_QUEUE_HP;
 
 	return smart_io_throttle_queue_from_ioprio(rq ?
@@ -329,8 +338,8 @@ smart_io_throttle_select_bio_queue(const struct bio *bio)
 			SMART_IO_QUEUE_RT : SMART_IO_QUEUE_BE;
 	if (smart_io_throttle_is_smart_ioprio(bio->bi_ioprio))
 		return SMART_IO_QUEUE_HP;
-	if (smart_io_throttle_current_can_mark_hp() ||
-	    smart_io_throttle_rt_read_can_mark_hp(bio->bi_ioprio, bio_op(bio)))
+	if (smart_io_throttle_current_can_mark_hp(bio->bi_ioprio,
+							 bio->bi_opf, bio_op(bio)))
 		return SMART_IO_QUEUE_HP;
 
 	return smart_io_throttle_queue_from_ioprio(bio->bi_ioprio);
@@ -339,9 +348,8 @@ smart_io_throttle_select_bio_queue(const struct bio *bio)
 void smart_io_throttle_mark_bio_hp(struct bio *bio)
 {
 	if (!bio || bio_op(bio) != REQ_OP_READ ||
-	    !(smart_io_throttle_current_can_mark_hp() ||
-		      smart_io_throttle_rt_read_can_mark_hp(bio->bi_ioprio,
-								 bio_op(bio))))
+	    !smart_io_throttle_current_can_mark_hp(bio->bi_ioprio,
+							 bio->bi_opf, bio_op(bio)))
 		return;
 
 	bio->bi_ioprio = smart_io_throttle_add_hp_hint(bio->bi_ioprio);
@@ -350,7 +358,8 @@ void smart_io_throttle_mark_bio_hp(struct bio *bio)
 void smart_io_throttle_mark_bio_vip(struct bio *bio)
 {
 	if (!bio || bio_op(bio) != REQ_OP_READ ||
-	    !smart_io_throttle_current_can_mark_vip())
+	    !smart_io_throttle_current_can_mark_vip(bio->bi_ioprio,
+							 bio->bi_opf, bio_op(bio)))
 		return;
 
 	bio->bi_ioprio = smart_io_throttle_set_private_hint(
@@ -365,9 +374,28 @@ void smart_io_throttle_mark_bio_pgf(struct bio *bio)
 	bio->bi_ioprio = smart_io_throttle_add_pgf_hint(bio->bi_ioprio);
 }
 
+void smart_io_throttle_mark_bio_pi(struct bio *bio)
+{
+	if (!bio || bio_op(bio) != REQ_OP_READ ||
+	    !smart_io_pi_current_marked())
+		return;
+
+	bio->bi_ioprio = smart_io_throttle_set_private_hint(
+		bio->bi_ioprio, SMART_IO_HP_IOPRIO_HINT |
+		SMART_IO_PI_IOPRIO_HINT | SMART_IO_VIP_IOPRIO_HINT);
+}
+
 void smart_io_throttle_mark_request_hp(struct request *rq)
 {
-	if (!rq || smart_io_throttle_is_smart_ioprio(req_get_ioprio(rq)))
+	if (!rq)
+		return;
+	if (req_op(rq) == REQ_OP_READ && smart_io_pi_current_marked()) {
+		rq->ioprio = smart_io_throttle_set_private_hint(
+			req_get_ioprio(rq), SMART_IO_HP_IOPRIO_HINT |
+			SMART_IO_PI_IOPRIO_HINT | SMART_IO_VIP_IOPRIO_HINT);
+		return;
+	}
+	if (smart_io_throttle_is_smart_ioprio(req_get_ioprio(rq)))
 		return;
 
 	rq->ioprio = smart_io_throttle_add_hp_hint(req_get_ioprio(rq));

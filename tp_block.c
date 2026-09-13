@@ -8,6 +8,7 @@
 #include "smart_io_throttle.h"
 #include "smart_io_types.h"
 #include "tp_filemap.h"
+#include "tp_pi.h"
 #include "trace_instance.h"
 
 static void tp_rq_insert_cb(void *ignore, struct request *rq)
@@ -24,6 +25,7 @@ static void tp_bio_queue_cb(void *ignore, struct bio *bio)
 		smart_io_throttle_mark_bio_pgf(bio);
 	else
 		smart_io_throttle_mark_bio_hp(bio);
+	smart_io_throttle_mark_bio_pi(bio);
 	smart_io_throttle_mark_bio_vip(bio);
 }
 

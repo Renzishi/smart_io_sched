@@ -297,6 +297,7 @@ smart_io_throttle_select_bio_queue(const struct bio *bio);
 void smart_io_throttle_mark_bio_hp(struct bio *bio);
 void smart_io_throttle_mark_bio_vip(struct bio *bio);
 void smart_io_throttle_mark_bio_pgf(struct bio *bio);
+void smart_io_throttle_mark_bio_pi(struct bio *bio);
 void smart_io_throttle_mark_request_hp(struct request *rq);
 bool smart_io_throttle_request_is_vip(const struct request *rq);
 u64 smart_io_throttle_request_id(const struct request *rq);

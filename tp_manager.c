@@ -5,6 +5,7 @@
 #include "tp_f2fs.h"
 #include "tp_filemap.h"
 #include "tp_pagecache_demo.h"
+#include "tp_pi.h"
 #include "tp_psi.h"
 #include "tp_sched.h"
 
@@ -15,8 +16,13 @@ int smart_io_tp_init(void)
 {
 	int ret;
 
+	ret = register_pi_tracepoints();
+	if (ret)
+		return ret;
+
 	ret = register_block_tracepoints();
 	if (ret) {
+		unregister_pi_tracepoints();
 		smart_io_log_err("failed to register block tracepoints: %d\n", ret);
 		return ret;
 	}
@@ -81,6 +87,7 @@ int smart_io_tp_init(void)
 
 void smart_io_tp_exit(void)
 {
+	unregister_pi_tracepoints();
 	unregister_sched_tracepoints();
 	// unregister_binder_tracepoints();
 	unregister_pagecache_demo();

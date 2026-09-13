@@ -14,6 +14,7 @@
 #include "smart_io_log.h"
 #include "system_context.h"
 #include "tp_filemap.h"
+#include "tp_pi.h"
 #include "trace_instance.h"
 #include "tool.h"
 
@@ -149,6 +150,7 @@ static void emit_fg_main_pid_state(void)
 	state_enum = smart_io_task_state_to_enum(raw_state);
 	u32 mem_total_kb = pages_to_kb(totalram_pages());
 	u32 mem_avail_kb = pages_to_kb(si_mem_available());
+	u32 mem_free_kb = pages_to_kb(global_zone_page_state(NR_FREE_PAGES));
 	u32 file_pages_kb = pages_to_kb(global_node_page_state(NR_FILE_PAGES));
 	u32 dirty_pages_kb = pages_to_kb(global_node_page_state(NR_FILE_DIRTY));
 	u32 writeback_pages_kb = pages_to_kb(global_node_page_state(NR_WRITEBACK));
@@ -167,10 +169,10 @@ static void emit_fg_main_pid_state(void)
 	// smart_io_raw_emit("main_pid_state_sample: ts=%llu uid=%d pid=%d run_pct=%u state=%u state_s=%s cpuid=%d mem_total_kb=%u mem_avail_kb=%u file_pages_kb=%u dirty_pages_kb=%u writeback_pages_kb=%u swap_total_kb=%u swap_used_kb=%u\n",
 	// 		  now, uid, pid, run_pct, state_enum,
 	// 		  smart_io_task_state_to_str(state_enum), cpuid, mem_total_kb, mem_avail_kb, file_pages_kb, dirty_pages_kb, writeback_pages_kb, swap_total_kb, swap_used_kb);
-	smart_io_raw_emit("main_pid_state_sample: ts=%llu uid=%d pid=%d state=%u state_s=%s cpuid=%d mem_total_kb=%u mem_avail_kb=%u file_pages_kb=%u dirty_pages_kb=%u writeback_pages_kb=%u swap_total_kb=%u swap_used_kb=%u\n",
+	smart_io_raw_emit("main_pid_state_sample: ts=%llu uid=%d pid=%d state=%u state_s=%s cpuid=%d mem_total_kb=%u mem_free_kb=%u mem_avail_kb=%u file_pages_kb=%u dirty_pages_kb=%u writeback_pages_kb=%u swap_total_kb=%u swap_used_kb=%u\n",
 				  now, uid, pid, state_enum,
 				  smart_io_task_state_to_str(state_enum), cpuid, mem_total_kb,
-				  mem_avail_kb, file_pages_kb, dirty_pages_kb,
+				  mem_free_kb, mem_avail_kb, file_pages_kb, dirty_pages_kb,
 				  writeback_pages_kb, swap_total_kb, swap_used_kb);
 }
 
@@ -259,6 +261,7 @@ void smart_io_set_fg_main_pid(pid_t pid)
 {
 	if (pid == atomic_read(&fg_main_pid))
 		return;
+	smart_io_pi_clear_owner("fg_main_pid_change");
 	atomic_set(&fg_main_pid, pid);
 	// u64 u_s_time = 0;
 	// bool valid = smart_io_snapshot_task_state(pid, NULL, NULL, &u_s_time);
