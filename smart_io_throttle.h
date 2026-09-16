@@ -11,6 +11,8 @@
 #include <linux/types.h>
 #include <linux/workqueue.h>
 
+#include "smart_io_rl.h"
+
 #define SMART_IO_DEV_LAT_WINDOW 5
 #define SMART_IO_DEV_LAT_WINDOW_MAX_US 10000U
 #define SMART_IO_FEEDBACK_SAMPLE_MAX 5
@@ -83,6 +85,7 @@ struct smart_io_action {
 struct smart_io_completion_sample {
 	u64 complete_ts_ns;
 	u32 dev_lat_us;
+	enum req_op op;
 	bool is_fg;
 };
 
@@ -162,8 +165,11 @@ struct smart_io_throttle_ctx {
 	u32 pending_fg;
 	u32 pending_bg;
 	struct smart_io_completion_sample dev_lat[SMART_IO_DEV_LAT_WINDOW];
+	struct smart_io_completion_sample rl_dev_lat[SMART_IO_RL_DEV_LAT_WINDOW];
 	u8 dev_lat_head;
 	u8 dev_lat_count;
+	u8 rl_dev_lat_head;
+	u8 rl_dev_lat_count;
 
 	u64 session_id;
 	u64 control_id;
@@ -354,5 +360,9 @@ const char *smart_io_action_source_name(enum smart_io_action_source source);
 const char *smart_io_gate_reason_name(enum smart_io_gate_reason reason);
 const char *smart_io_feedback_state_name(enum smart_io_feedback_state state);
 void smart_io_throttle_get_stats(struct smart_io_throttle_stats *stats);
+bool smart_io_throttle_get_rl_device_snapshot(
+		const struct request *rq,
+		struct smart_io_rl_device_snapshot *snapshot);
+int smart_io_throttle_get_rl_sector_class(const struct request *rq);
 
 #endif

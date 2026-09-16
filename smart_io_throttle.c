@@ -24,6 +24,7 @@
 
 #include "smart_io_model_fp32.h"
 #include "block_helper.h"
+#include "smart_io_rl.h"
 #include "smart_io_throttle.h"
 #include "system_context.h"
 #include "tp_pi.h"
@@ -305,10 +306,26 @@ smart_io_throttle_select_queue(const struct request *rq)
 	unsigned int op;
 
 	if (rq) {
+		ioprio = req_get_ioprio((struct request *)rq);
 		meta = smart_io_throttle_rq_meta(rq);
+		/* An already classified request keeps its metadata across requeue and
+		 * merge; it is more authoritative than a stale hint bit. */
 		if (meta)
 			return meta->queue_class;
-		ioprio = req_get_ioprio((struct request *)rq);
+		/*
+		 * RL-controlled READ: the RL action bits (7-8) are authoritative.
+		 * Check before the baseline HP rules so a foreground sync read that
+		 * RL demoted to RT is not bumped back to HP.
+		 */
+		if (IOPRIO_PRIO_HINT(ioprio) & SMART_IO_RL_ACTION_MASK) {
+			int rl_action = smart_io_rl_decode_action(ioprio);
+
+			if (rl_action == SMART_IO_RL_ACTION_RT)
+				return SMART_IO_QUEUE_RT;
+			if (rl_action == SMART_IO_RL_ACTION_VIP ||
+			    rl_action == SMART_IO_RL_ACTION_HP)
+				return SMART_IO_QUEUE_HP;
+		}
 		op = req_op((struct request *)rq);
 		if (op_is_write(op))
 			return smart_io_throttle_is_smart_ioprio(ioprio) ?
@@ -552,6 +569,9 @@ static void smart_io_throttle_reset_window_locked(struct smart_io_throttle_ctx *
 	memset(ctx->dev_lat, 0, sizeof(ctx->dev_lat));
 	ctx->dev_lat_head = 0;
 	ctx->dev_lat_count = 0;
+	memset(ctx->rl_dev_lat, 0, sizeof(ctx->rl_dev_lat));
+	ctx->rl_dev_lat_head = 0;
+	ctx->rl_dev_lat_count = 0;
 }
 
 static void smart_io_throttle_set_baseline_action_locked(struct smart_io_throttle_ctx *ctx)
@@ -2225,6 +2245,118 @@ static bool smart_io_throttle_snapshot_state_locked(
 	return true;
 }
 
+bool smart_io_throttle_get_rl_device_snapshot(
+		const struct request *rq,
+		struct smart_io_rl_device_snapshot *snapshot)
+{
+	struct smart_io_throttle_ctx *ctx;
+	struct smart_io_rq_meta *meta;
+	unsigned long flags;
+	u64 read_lat = 0;
+	u64 write_lat = 0;
+	u32 read_lat_count = 0;
+	u32 write_lat_count = 0;
+	u32 i;
+	int bkt;
+
+	if (!rq || !rq->q || !snapshot)
+		return false;
+
+	memset(snapshot, 0, sizeof(*snapshot));
+	rcu_read_lock();
+	ctx = smart_io_throttle_find_ctx_rcu(rq->q);
+	if (!ctx) {
+		rcu_read_unlock();
+		return false;
+	}
+
+	spin_lock_irqsave(&ctx->lock, flags);
+	snapshot->tag_used = ctx->issued_depth;
+	snapshot->tag_max = blk_queue_depth(rq->q);
+	hash_for_each(ctx->active, bkt, meta, active_node) {
+		if (meta->issued_accounted) {
+			if (meta->op == REQ_OP_WRITE)
+				snapshot->w_flt++;
+			else if (meta->op == REQ_OP_READ)
+				snapshot->r_flt++;
+		}
+		if (!meta->queued)
+			continue;
+		if (meta->op == REQ_OP_WRITE)
+			snapshot->w_wait++;
+		else if (meta->op == REQ_OP_READ)
+			snapshot->r_wait++;
+	}
+	for (i = 0; i < ctx->rl_dev_lat_count; i++) {
+		const struct smart_io_completion_sample *sample =
+			&ctx->rl_dev_lat[i];
+
+		if (sample->op == REQ_OP_WRITE) {
+			write_lat += sample->dev_lat_us;
+			write_lat_count++;
+		} else if (sample->op == REQ_OP_READ) {
+			read_lat += sample->dev_lat_us;
+			read_lat_count++;
+		}
+	}
+	spin_unlock_irqrestore(&ctx->lock, flags);
+	rcu_read_unlock();
+
+	if (read_lat_count)
+		snapshot->r_lat_us = div_u64(read_lat, read_lat_count);
+	if (write_lat_count)
+		snapshot->w_lat_us = div_u64(write_lat, write_lat_count);
+	return true;
+}
+
+int smart_io_throttle_get_rl_sector_class(const struct request *rq)
+{
+	struct smart_io_throttle_ctx *ctx;
+	struct smart_io_rq_meta *meta;
+	unsigned long flags;
+	sector_t start;
+	sector_t end;
+	int result = SMART_IO_RL_SECTOR_UNKNOWN;
+	u32 scanned = 0;
+	int bkt;
+	bool have_read = false;
+
+	if (!rq || !rq->q || req_op((struct request *)rq) != REQ_OP_READ)
+		return SMART_IO_RL_SECTOR_UNKNOWN;
+
+	start = blk_rq_pos((struct request *)rq);
+	end = start + blk_rq_sectors((struct request *)rq);
+	if (end < start)
+		return SMART_IO_RL_SECTOR_UNKNOWN;
+
+	rcu_read_lock();
+	ctx = smart_io_throttle_find_ctx_rcu(rq->q);
+	if (!ctx) {
+		rcu_read_unlock();
+		return SMART_IO_RL_SECTOR_UNKNOWN;
+	}
+
+	spin_lock_irqsave(&ctx->lock, flags);
+	hash_for_each(ctx->active, bkt, meta, active_node) {
+		if (++scanned > ctx->meta_capacity)
+			break;
+		if (meta->op != REQ_OP_READ || !meta->inflight_indexed)
+			continue;
+		have_read = true;
+		if (meta->end_sector == start) {
+			result = SMART_IO_RL_SECTOR_SEQ_FORWARD;
+			break;
+		}
+		if (end == meta->start_sector)
+			result = SMART_IO_RL_SECTOR_SEQ_BACKWARD;
+	}
+	if (result == SMART_IO_RL_SECTOR_UNKNOWN && have_read)
+		result = SMART_IO_RL_SECTOR_NON_CONTIGUOUS;
+	spin_unlock_irqrestore(&ctx->lock, flags);
+	rcu_read_unlock();
+	return result;
+}
+
 static bool smart_io_throttle_slow_window_locked(
 		struct smart_io_throttle_ctx *ctx, u32 threshold_us)
 {
@@ -2485,6 +2617,19 @@ void smart_io_throttle_record_complete(struct request *rq, blk_status_t status,
 			feedback_result = "sample";
 			ctx->feedback_state = SMART_IO_FEEDBACK_WAIT_DISPATCH;
 		}
+	}
+	if (final && latency_valid && !meta->device_time_excluded) {
+		struct smart_io_completion_sample *sample;
+
+		sample = &ctx->rl_dev_lat[ctx->rl_dev_lat_head];
+		sample->complete_ts_ns = now_ns;
+		sample->dev_lat_us = latency_us;
+		sample->op = meta->op;
+		sample->is_fg = meta->class == SMART_IO_RQ_FOREGROUND;
+		ctx->rl_dev_lat_head = (ctx->rl_dev_lat_head + 1) %
+			SMART_IO_RL_DEV_LAT_WINDOW;
+		if (ctx->rl_dev_lat_count < SMART_IO_RL_DEV_LAT_WINDOW)
+			ctx->rl_dev_lat_count++;
 	}
 	if (!feedback_complete && final && ctx->feedback_meta == meta) {
 		feedback_sample_no = ctx->feedback_vote_count + 1;

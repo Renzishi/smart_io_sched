@@ -24,9 +24,11 @@
 
 #include "block_helper.h"
 #include "io_semantics.h"
+#include "smart_io_rl.h"
 #include "smart_io_log.h"
 #include "smart_io_policy.h"
 #include "system_context.h"
+#include "smart_io_throttle.h"
 #include "trace_instance.h"
 #include "tp_pagecache_demo.h"
 #include "tool.h"
@@ -164,7 +166,6 @@ static DEFINE_SPINLOCK(hot_inode_lock);
 
 static atomic_t in_flight = ATOMIC_INIT(0);
 static u32 window_sz_ms = SMART_IO_TICK_MS;
-static u32 queue_depth = DEFAULT_QUEUE_DEPTH;
 /* request_queue has size/depth limits, not a portable peak throughput. */
 static u32 blk_max_bw_kbps = DEFAULT_BLK_MAX_BW_KBPS;
 static u64 busy_ns;
@@ -207,28 +208,6 @@ u32 get_nr_bio(struct request *rq)
 		count++;
 	}
 	return count;
-}
-
-static u32 get_rq_tag_depth_max(struct request *rq)
-{
-	if (!rq || !rq->q)
-		return 0;
-
-	return blk_queue_depth(rq->q);
-}
-
-static int get_rq_tag_depth_cur(struct request *rq)
-{
-	struct blk_mq_hw_ctx *hctx;
-
-	if (!rq)
-		return -1;
-
-	hctx = READ_ONCE(rq->mq_hctx);
-	if (!hctx)
-		return -1;
-
-	return __blk_mq_active_requests(hctx);
 }
 
 static struct rq_record *rq_find_locked(struct rq_shard *shard, struct request *rq)
@@ -576,14 +555,6 @@ static u32 read_loadavg_1m_x100(void)
 	return READ_ONCE(cached_loadavg_1m_x100);
 }
 
-static u32 calc_queue_sat(u32 flight)
-{
-	if (!queue_depth)
-		return 0;
-
-	return flight * 100 / queue_depth;
-}
-
 void set_loadavg_1m_x100(u32 loadavg_1m_x100)
 {
 	WRITE_ONCE(cached_loadavg_1m_x100, loadavg_1m_x100);
@@ -655,41 +626,60 @@ void f2fs_cp_end(void)
 static void emit_raw_insert(const struct smart_io_event *evt,
 				     struct request *rq)
 {
-	u32 tag_depth_max = get_rq_tag_depth_max(rq);
-	int tag_depth_cur = get_rq_tag_depth_cur(rq);
+	struct smart_io_rl_device_snapshot snapshot;
+	u32 tag_used = 0;
+	u32 tag_max = 0;
+	bool have_snapshot;
+
+	have_snapshot = smart_io_throttle_get_rl_device_snapshot(rq, &snapshot);
+	if (have_snapshot) {
+		tag_used = snapshot.tag_used;
+		tag_max = snapshot.tag_max;
+	}
 
 	if (evt->thread_role == ROLE_FIO) {
 		smart_io_raw_emit("block_rq_insert: "
-			  "ts_insert=%llu rq_p=%p thread_role=%u tag_max=%u tag_cur=%d\n",
-			  evt->ts_insert, (void *)rq, evt->thread_role, tag_depth_max, tag_depth_cur);
+			  "ts_insert=%llu rq_p=%p thread_role=%u tag_max=%u tag_cur=%u\n",
+			  evt->ts_insert, (void *)rq, evt->thread_role, tag_max, tag_used);
 		return;
 	}
 
 	smart_io_raw_emit("block_rq_insert: "
 			  "ts_insert=%llu uid=%u pid=%d tgid=%d rq_p=%p io_size=%u cmd=%u "
 			  "sector=%llu ioprio=%u file_ext=%u file_ext_s=%s fg=%u thread_role=%u "
-			  "fs_type=%s dev_name=%s remap_from=%s remap_mixed=%u "
-			  "inode_hash=%llu folio_index=%llu "
-			  "tag_max=%u tag_cur=%d\n",
+			  "cpu_cgroup=%u fs_type=%s dev_name=%s remap_from=%s remap_mixed=%u "
+			  "inode_hash=%llu folio_index=%llu tag_max=%u tag_cur=%u "
+			  "r_flt=%u w_flt=%u r_wait=%u w_wait=%u "
+			  "r_lat_us=%u w_lat_us=%u sector_class=%u runqueue=%u\n",
 			  evt->ts_insert, evt->uid, current->pid, current->tgid, (void *)rq,
 			  blk_rq_bytes(rq), rq->cmd_flags, evt->sector, evt->ioprio_class,
-			  evt->file_ext, evt->file_ext_str, evt->is_front, evt->thread_role, evt->fs_type,
+			  evt->file_ext, evt->file_ext_str, evt->is_front,
+			  evt->thread_role, evt->cpu_cgroup_class,
+			  evt->fs_type,
 			  evt->dev_name, evt->remap_from, evt->remap_mixed,
 			  evt->inode_hash,
-			  evt->folio_index, tag_depth_max, tag_depth_cur);
+			  evt->folio_index, tag_max, tag_used,
+			  evt->r_flt, evt->w_flt, evt->r_wait, evt->w_wait,
+			  evt->r_lat_us, evt->w_lat_us, evt->sector_class,
+			  evt->runqueue_len);
 }
 
 static void emit_raw_issue(const struct smart_io_event *evt,
 				    struct request *rq, bool new_record)
 {
 	u32 nr_bio = get_nr_bio(rq);
-	u32 tag_depth_max = get_rq_tag_depth_max(rq);
-	int tag_depth_cur = get_rq_tag_depth_cur(rq);
+	struct smart_io_rl_device_snapshot snapshot;
+	u32 tag_used = 0;
+	u32 tag_max = 0;
+	if (smart_io_throttle_get_rl_device_snapshot(rq, &snapshot)) {
+		tag_used = snapshot.tag_used;
+		tag_max = snapshot.tag_max;
+	}
 
 	if (evt->thread_role == ROLE_FIO) {
 		smart_io_raw_emit("block_rq_issue: "
-			  "ts_issue=%llu rq_p=%p thread_role=%u tag_max=%u tag_cur=%d\n",
-			  evt->ts_issue, (void *)rq, evt->thread_role, tag_depth_max, tag_depth_cur);
+			  "ts_issue=%llu rq_p=%p thread_role=%u tag_max=%u tag_cur=%u\n",
+			  evt->ts_issue, (void *)rq, evt->thread_role, tag_max, tag_used);
 		return;
 	}
 
@@ -699,45 +689,49 @@ static void emit_raw_issue(const struct smart_io_event *evt,
 				  "sector=%llu ioprio=%u file_ext=%u file_ext_s=%s fg=%u thread_role=%u "
 				  "fs_type=%s dev_name=%s remap_from=%s remap_mixed=%u "
 				  "inode_hash=%llu folio_index=%llu nr_bio=%u "
-				  "tag_max=%u tag_cur=%d direct=1\n",
+				  "tag_max=%u tag_cur=%u direct=1\n",
 				  evt->ts_issue, evt->uid, current->pid, current->tgid,
 				  (void *)rq, blk_rq_bytes(rq), rq->cmd_flags, evt->sector,
 				  evt->ioprio_class, evt->file_ext, evt->file_ext_str, evt->is_front,
 				  evt->thread_role, evt->fs_type, evt->dev_name, evt->remap_from,
-				  evt->remap_mixed,
-				  evt->inode_hash, evt->folio_index, evt->io_in_flight,
-				  nr_bio, tag_depth_max, tag_depth_cur);
+				  evt->remap_mixed, evt->inode_hash, evt->folio_index,
+				  nr_bio, tag_max, tag_used);
 		return;
 	}
 
 	smart_io_raw_emit("block_rq_issue: "
 			  "ts_issue=%llu uid=%u inode_hash=%llu rq_p=%p io_op=%u "
-			  "nr_bio=%u tag_max=%u tag_cur=%d sched_lat_ns=%llu\n",
+			  "nr_bio=%u tag_max=%u tag_cur=%u sched_lat_ns=%llu\n",
 			  evt->ts_issue, evt->uid, evt->inode_hash, (void *)rq,
 			  evt->io_op, nr_bio,
-			  tag_depth_max, tag_depth_cur, evt->ts_issue - evt->ts_insert);
+			  tag_max, tag_used, evt->ts_issue - evt->ts_insert);
 }
 
 static void emit_raw_requeue(const struct smart_io_event *evt,
 				      struct request *rq)
 {
 	u32 nr_bio = get_nr_bio(rq);
-	u32 tag_depth_max = get_rq_tag_depth_max(rq);
-	int tag_depth_cur = get_rq_tag_depth_cur(rq);
+	struct smart_io_rl_device_snapshot snapshot;
+	u32 tag_used = 0;
+	u32 tag_max = 0;
+	if (smart_io_throttle_get_rl_device_snapshot(rq, &snapshot)) {
+		tag_used = snapshot.tag_used;
+		tag_max = snapshot.tag_max;
+	}
 
 	if (evt->thread_role == ROLE_FIO) {
 		smart_io_raw_emit("block_rq_requeue: "
-			  "ts_requeue=%llu rq_p=%p tag_max=%u tag_cur=%d\n",
-			  ktime_get_boottime_ns(), (void *)rq, tag_depth_max, tag_depth_cur);
+			  "ts_requeue=%llu rq_p=%p tag_max=%u tag_cur=%u\n",
+			  ktime_get_boottime_ns(), (void *)rq, tag_max, tag_used);
 		return;
 	}
 
 	smart_io_raw_emit("block_rq_requeue: "
 			  "ts_requeue=%llu uid=%u inode_hash=%llu rq_p=%p io_size=%u cmd=%u nr_bio=%u "
-			  "tag_max=%u tag_cur=%d sched_lat_ns=%llu\n",
+			  "tag_max=%u tag_cur=%u sched_lat_ns=%llu\n",
 			  ktime_get_boottime_ns(), evt->uid, evt->inode_hash,
 			  (void *)rq, blk_rq_bytes(rq), rq->cmd_flags,
-			  nr_bio, tag_depth_max, tag_depth_cur, evt->ts_requeue - evt->ts_insert);
+			  nr_bio, tag_max, tag_used, evt->ts_requeue - evt->ts_insert);
 }
 
 static void emit_raw_complete(const struct smart_io_event *evt,
@@ -765,7 +759,7 @@ static void fill_record_from_current(struct rq_record *rec, struct request *rq,
 	uid_t fg_uid;
 	u32 scene;
 	char comm[TASK_COMM_LEN];
-	u32 flight = (u32)atomic_read(&in_flight);
+	struct smart_io_rl_device_snapshot rl_device;
 
 	memset(evt, 0, sizeof(*evt));
 	smart_io_get_fg_ctx(&fg_uid, &scene);
@@ -780,12 +774,14 @@ static void fill_record_from_current(struct rq_record *rec, struct request *rq,
 	evt->scene_tag = scene;
 	evt->is_front = evt->uid == fg_uid;
 	evt->thread_role = match_thread_role(evt->uid, current->pid, current->tgid, comm, fg_uid);
+	evt->cpu_cgroup_class = smart_io_rl_cpu_cgroup_class();
 	evt->direct_path = direct_path ? 1 : 0;
 	evt->io_op = encode_io_op(req_op(rq));
 	rec->data_bytes = blk_rq_bytes(rq);
 	evt->io_size_kb = blk_rq_bytes(rq) >> 10;
 	evt->sector = blk_rq_pos(rq);
 	evt->ioprio_class = req_get_ioprio(rq);
+	evt->sector_class = smart_io_throttle_get_rl_sector_class(rq);
 
 	if (evt->thread_role == ROLE_FIO)
 		return;
@@ -806,33 +802,22 @@ static void fill_record_from_current(struct rq_record *rec, struct request *rq,
 						evt->fs_type,
 						sizeof(evt->fs_type));
 
-		if (!got_vfs_info && get_nr_bio(rq) > 1) {
-			struct bio *b;
-
-			__rq_for_each_bio(b, rq) {
-				if (b == bio)
-					continue;
-
-				got_vfs_info = extract_vfs_info(b,
-							      &evt->inode_hash,
-							      &evt->file_ext,
-							      &evt->folio_index,
-							      evt->file_ext_str,
-							      sizeof(evt->file_ext_str),
-							      evt->fs_type,
-							      sizeof(evt->fs_type));
-				if (got_vfs_info)
-					break;
-			}
-		}
 	}
-	evt->queue_saturate = calc_queue_sat(flight);
-	evt->io_in_flight = flight;
+	evt->runqueue_len = get_runqueue_len();
+	if (smart_io_throttle_get_rl_device_snapshot(rq, &rl_device)) {
+		evt->r_flt = rl_device.r_flt;
+		evt->w_flt = rl_device.w_flt;
+		evt->r_wait = rl_device.r_wait;
+		evt->w_wait = rl_device.w_wait;
+		evt->tag_used = rl_device.tag_used;
+		evt->tag_max = rl_device.tag_max;
+		evt->r_lat_us = rl_device.r_lat_us;
+		evt->w_lat_us = rl_device.w_lat_us;
+	}
 
 	if (raw_mode_enabled())
 		return;
 
-	evt->cgroup_io_weight = get_cgroup_weight(rq);
 	evt->f2fs_gc_active = atomic_read(&f2fs_gc_active) ? 1 : 0;
 	evt->f2fs_cp_active = atomic_read(&f2fs_cp_active) ? 1 : 0;
 	evt->is_hot_file = smart_io_is_hot_inode(evt->inode_hash) ? 1 : 0;
@@ -842,7 +827,6 @@ static void fill_record_from_current(struct rq_record *rec, struct request *rq,
 	evt->swap_mb = get_swap_used_mb();
 	evt->cpu_loadavg_1m = read_loadavg_1m_x100();
 	evt->online_cpus = (u8)min_t(unsigned int, num_online_cpus(), U8_MAX);
-	evt->runqueue_len = get_runqueue_len();
 	evt->device_util_pct = snapshot_device_util();
 	evt->insert_cpuid = smp_processor_id();
 	evt->io_bw_kbps = uid_io_prev_bandwidth_kbps(evt->uid);

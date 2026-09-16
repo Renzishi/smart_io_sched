@@ -5,6 +5,7 @@
 #include <linux/container_of.h>
 #include <linux/rcupdate.h>
 #include <linux/pagemap.h>
+#include <linux/fs.h>
 #include <linux/blk-cgroup.h>
 #include <linux/cgroup.h>
 
@@ -12,13 +13,16 @@
 #include <block/elevator.h>
 
 #include "smart_io_types.h"
+#include "smart_io_rl.h"
 #include "smart_io_log.h"
 
 static inline u16 get_file_ext_id(const char *ext)
 {
 	if (!ext)
 		return SMART_IO_FILE_EXT_UNKNOWN;
-	if (!strcmp(ext, ".db"))
+	if (!strcmp(ext, ".db") || !strcmp(ext, ".sqlite") ||
+		    !strcmp(ext, ".db-wal") || !strcmp(ext, ".db-shm") ||
+		    !strcmp(ext, ".db-journal"))
 		return SMART_IO_FILE_EXT_DB;
 	if (!strcmp(ext, ".so"))
 		return SMART_IO_FILE_EXT_SO;
@@ -32,6 +36,14 @@ static inline u16 get_file_ext_id(const char *ext)
 		return SMART_IO_FILE_EXT_VDEX;
 	if (!strcmp(ext, ".odex"))
 		return SMART_IO_FILE_EXT_ODEX;
+	if (!strcmp(ext, ".art"))
+		return SMART_IO_FILE_EXT_ART;
+	if (!strcmp(ext, ".jar"))
+		return SMART_IO_FILE_EXT_JAR;
+	if (!strcmp(ext, ".ttf") || !strcmp(ext, ".otf") ||
+	    !strcmp(ext, ".ttx"))
+		return SMART_IO_FILE_EXT_FONT;
+
 	return SMART_IO_FILE_EXT_UNKNOWN;
 }
 
@@ -290,6 +302,12 @@ bool extract_vfs_info(struct bio *bio, u64 *inode_hash, u16 *ext, u64 *folio_ind
 	full_path = blk_get_pathname(inode, path_buf, 512);
 	if (IS_ERR(full_path)) {
 		set_vfs_placeholder(ext_str, ext_str_len, "nopath");
+		if (inode->i_ino == 1)
+			*ext = SMART_IO_FILE_EXT_NODE_INODE;
+		else if (inode->i_ino == 2)
+			*ext = SMART_IO_FILE_EXT_META_INODE;
+		else
+			*ext = SMART_IO_FILE_EXT_OTHER;
 		return false;
 	}
 
@@ -313,7 +331,49 @@ void extract_device_name(struct request *rq, char *dev_name, size_t dev_name_len
 	}
 }
 
-u32 get_cgroup_weight(struct request *rq)
+u16 extract_first_bio_file_ext(struct bio *bio)
 {
-	return CGROUP_WEIGHT_DFL;
+	struct page *page;
+	struct folio *folio;
+	struct address_space *mapping;
+	struct inode *inode;
+	struct dentry *dentry;
+	const char *name;
+	const char *dot;
+	u16 ext_id = SMART_IO_FILE_EXT_OTHER;
+
+	if (!bio || !bio_has_data(bio))
+		return SMART_IO_FILE_EXT_UNKNOWN;
+
+	page = bio_page(bio);
+	if (!page)
+		return SMART_IO_FILE_EXT_UNKNOWN;
+
+	/* Only rq->bio is inspected. This helper must remain bounded and
+	 * allocation-free because it runs from the request insert path. */
+	folio = page_folio(page);
+	mapping = folio_mapping(folio);
+	if (!mapping || !mapping->host)
+		return SMART_IO_FILE_EXT_UNKNOWN;
+	inode = mapping->host;
+
+	if (!inode) 
+		return SMART_IO_FILE_EXT_UNKNOWN;
+
+	if (inode->i_ino == 1)
+		return SMART_IO_FILE_EXT_NODE_INODE;
+	if (inode->i_ino == 2)
+		return SMART_IO_FILE_EXT_META_INODE;
+
+	rcu_read_lock();
+	hlist_for_each_entry_rcu(dentry, &inode->i_dentry, d_u.d_alias) {
+		if (!dentry->d_name.name || !dentry->d_name.len)
+			continue;
+		name = dentry->d_name.name;
+		dot = strrchr(name, '.');
+		ext_id = get_file_ext_id(dot);
+		break;
+	}
+	rcu_read_unlock();
+	return ext_id;
 }

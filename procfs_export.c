@@ -9,6 +9,7 @@
 #include "smart_io_dirtyrate.h"
 #include "smart_io_log.h"
 #include "smart_io_policy.h"
+#include "smart_io_rl.h"
 #include "smart_io_throttle.h"
 #include "smart_io_types.h"
 #include "system_context.h"
@@ -794,7 +795,8 @@ static int event_show(struct seq_file *m, void *v)
 		   "ts_insert:%llu ts_issue:%llu ts_complete:%llu "
 		   "uid:%u scene_tag:%u is_front:%u thread_role:%u "
 		   "io_op:%u io_sz_kb:%u sector:%llu ioprio:%u file_ext:%u file_ext_s:%s fs:%s dev_name:%s remap_from:%s remap_mixed:%u dev_type:%u "
-		   "io_inflight:%u queue_sat:%u cg_io_weight:%u "
+		   "r_flt:%u w_flt:%u r_wait:%u w_wait:%u tag_cur:%u tag_max:%u "
+		   "r_lat_us:%u w_lat_us:%u cg_io_weight:%u "
 		   "gc:%u cp:%u hot_file:%u "
 		   "mem_avail_mb:%u dirty_mb:%u wb_mb:%u swap_mb:%u cpu_loadavg_1m:%u "
 		   "online_cpus:%u runqueue:%u dev_util_pct:%u "
@@ -809,7 +811,8 @@ static int event_show(struct seq_file *m, void *v)
 		   e.io_op, e.io_size_kb, e.sector, e.ioprio_class, e.file_ext,
 		   e.file_ext_str, e.fs_type, e.dev_name, e.remap_from,
 		   e.remap_mixed, e.device_type,
-		   e.io_in_flight, e.queue_saturate, e.cgroup_io_weight,
+		   e.r_flt, e.w_flt, e.r_wait, e.w_wait, e.tag_used, e.tag_max,
+		   e.r_lat_us, e.w_lat_us, e.cgroup_io_weight,
 		   e.f2fs_gc_active, e.f2fs_cp_active, e.is_hot_file,
 		   e.mem_avail_mb, e.dirty_pages_mb, e.wb_pages_mb,
 		   e.swap_mb, e.cpu_loadavg_1m, e.online_cpus, e.runqueue_len,
@@ -996,6 +999,175 @@ static int debug_show(struct seq_file *m, void *v)
 static int debug_open(struct inode *i, struct file *f)
 {
 	return single_open(f, debug_show, NULL);
+}
+
+/*
+ * RL request-level priority collection knobs (doc §9). Modes: 0 off, 1 rule
+ * (A), 2 fixed action (B), 3 random (C), 4 model (D; safe fallback until
+ * request-RL weights are deployed).
+ */
+static int rl_mode_show(struct seq_file *m, void *v)
+{
+	seq_printf(m, "%u\n", smart_io_rl_get_mode());
+	return 0;
+}
+
+static int rl_mode_open(struct inode *i, struct file *f)
+{
+	return single_open(f, rl_mode_show, NULL);
+}
+
+static ssize_t rl_mode_write(struct file *f, const char __user *ub, size_t c,
+			     loff_t *p)
+{
+	int mode;
+	int ret;
+
+	ret = proc_parse_int(ub, c, &mode);
+	if (ret)
+		return ret;
+	if (mode < 0)
+		return -EINVAL;
+
+	ret = smart_io_rl_set_mode((u32)mode);
+	if (ret)
+		return ret;
+	return c;
+}
+
+static int rl_fixed_action_show(struct seq_file *m, void *v)
+{
+	static const char *names[4] = { "none", "vip", "hp", "rt" };
+	u32 action = smart_io_rl_get_fixed_action();
+
+	/* setter guarantees action is in {1,2,3}. */
+	seq_printf(m, "%s\n", action <= 3U ? names[action] : "unknown");
+	return 0;
+}
+
+static int rl_fixed_action_open(struct inode *i, struct file *f)
+{
+	return single_open(f, rl_fixed_action_show, NULL);
+}
+
+static ssize_t rl_fixed_action_write(struct file *f, const char __user *ub,
+				     size_t c, loff_t *p)
+{
+	char buf[8];
+	u32 action;
+
+	if (c > sizeof(buf) - 1)
+		return -EINVAL;
+	if (copy_from_user(buf, ub, c))
+		return -EFAULT;
+	buf[c] = 0;
+
+	if (!strcmp(strstrip(buf), "vip"))
+		action = SMART_IO_RL_ACTION_VIP;
+	else if (!strcmp(strstrip(buf), "hp"))
+		action = SMART_IO_RL_ACTION_HP;
+	else if (!strcmp(strstrip(buf), "rt"))
+		action = SMART_IO_RL_ACTION_RT;
+	else
+		return -EINVAL;
+
+	if (smart_io_rl_set_fixed_action(action))
+		return -EINVAL;
+	return c;
+}
+
+static int rl_random_probs_show(struct seq_file *m, void *v)
+{
+	struct smart_io_rl_stats st;
+
+	smart_io_rl_get_stats(&st);
+	seq_printf(m, "%u %u %u\n", st.rl_random_vip_pct,
+		   st.rl_random_hp_pct, st.rl_random_rt_pct);
+	return 0;
+}
+
+static int rl_random_probs_open(struct inode *i, struct file *f)
+{
+	return single_open(f, rl_random_probs_show, NULL);
+}
+
+static ssize_t rl_random_probs_write(struct file *f, const char __user *ub,
+				     size_t c, loff_t *p)
+{
+	char buf[32];
+	u32 vip_pct, hp_pct, rt_pct;
+
+	if (c > sizeof(buf) - 1)
+		return -EINVAL;
+	if (copy_from_user(buf, ub, c))
+		return -EFAULT;
+	buf[c] = 0;
+
+	if (sscanf(strstrip(buf), "%u %u %u", &vip_pct, &hp_pct, &rt_pct) != 3)
+		return -EINVAL;
+	if (smart_io_rl_set_random_probs(vip_pct, hp_pct, rt_pct))
+		return -EINVAL;
+	return c;
+}
+
+static int rl_seed_show(struct seq_file *m, void *v)
+{
+	struct smart_io_rl_stats st;
+
+	smart_io_rl_get_stats(&st);
+	seq_printf(m, "%u\n", st.rl_random_seed);
+	return 0;
+}
+
+static int rl_seed_open(struct inode *i, struct file *f)
+{
+	return single_open(f, rl_seed_show, NULL);
+}
+
+static ssize_t rl_seed_write(struct file *f, const char __user *ub, size_t c,
+			     loff_t *p)
+{
+	u32 seed;
+	int ret;
+
+	ret = proc_parse_u32(ub, c, &seed);
+	if (ret)
+		return ret;
+	if (smart_io_rl_set_random_seed(seed))
+		return ret;
+	return c;
+}
+
+static int rl_stats_show(struct seq_file *m, void *v)
+{
+	struct smart_io_rl_stats st;
+
+	smart_io_rl_get_stats(&st);
+	seq_printf(m, "mode=%u\n", st.rl_mode);
+	seq_printf(m, "fixed_action=%u\n", st.rl_fixed_action);
+	seq_printf(m, "random_probs=%u %u %u\n", st.rl_random_vip_pct,
+		   st.rl_random_hp_pct, st.rl_random_rt_pct);
+	seq_printf(m, "random_seed=%u\n", st.rl_random_seed);
+	seq_printf(m, "rl_decision_count=%llu\n",
+		   (unsigned long long)st.rl_decision_count);
+	seq_printf(m, "rl_protected_count=%llu\n",
+		   (unsigned long long)st.rl_protected_count);
+	seq_printf(m, "rl_fallback_count=%llu\n",
+		   (unsigned long long)st.rl_fallback_count);
+	seq_printf(m, "rl_decode_error_count=%llu\n",
+		   (unsigned long long)st.rl_decode_error_count);
+	seq_printf(m, "rl_action_vip=%llu\n",
+		   (unsigned long long)st.rl_action_vip);
+	seq_printf(m, "rl_action_hp=%llu\n",
+		   (unsigned long long)st.rl_action_hp);
+	seq_printf(m, "rl_action_rt=%llu\n",
+		   (unsigned long long)st.rl_action_rt);
+	return 0;
+}
+
+static int rl_stats_open(struct inode *i, struct file *f)
+{
+	return single_open(f, rl_stats_show, NULL);
 }
 
 struct proc_node {
@@ -1250,6 +1422,65 @@ struct proc_node proc_nodes[] = {
 			.proc_release = single_release,
 		},
 		.mode = 0666,
+		.exist = false,
+	},
+	{
+		.name = "rl_mode",
+		.ops = &(struct proc_ops){
+			.proc_open = rl_mode_open,
+			.proc_read = seq_read,
+			.proc_write = rl_mode_write,
+			.proc_lseek = seq_lseek,
+			.proc_release = single_release,
+		},
+		.mode = 0644,
+		.exist = false,
+	},
+	{
+		.name = "rl_fixed_action",
+		.ops = &(struct proc_ops){
+			.proc_open = rl_fixed_action_open,
+			.proc_read = seq_read,
+			.proc_write = rl_fixed_action_write,
+			.proc_lseek = seq_lseek,
+			.proc_release = single_release,
+		},
+		.mode = 0644,
+		.exist = false,
+	},
+	{
+		.name = "rl_random_probs",
+		.ops = &(struct proc_ops){
+			.proc_open = rl_random_probs_open,
+			.proc_read = seq_read,
+			.proc_write = rl_random_probs_write,
+			.proc_lseek = seq_lseek,
+			.proc_release = single_release,
+		},
+		.mode = 0644,
+		.exist = false,
+	},
+	{
+		.name = "rl_seed",
+		.ops = &(struct proc_ops){
+			.proc_open = rl_seed_open,
+			.proc_read = seq_read,
+			.proc_write = rl_seed_write,
+			.proc_lseek = seq_lseek,
+			.proc_release = single_release,
+		},
+		.mode = 0644,
+		.exist = false,
+	},
+	{
+		.name = "rl_stats",
+		.ops = &(struct proc_ops){
+			.proc_open = rl_stats_open,
+			.proc_read = seq_read,
+			.proc_lseek = seq_lseek,
+			.proc_release = single_release,
+		},
+		.mode = 0444,
 		.exist = false,
 	},
 };

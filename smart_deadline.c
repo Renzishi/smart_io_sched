@@ -25,6 +25,7 @@
 #include <block/blk-mq-sched.h>
 
 #include "smart_deadline.h"
+#include "smart_io_rl.h"
 #include "smart_io_throttle.h"
 
 /*
@@ -1112,6 +1113,13 @@ static void dd_insert_request(struct blk_mq_hw_ctx *hctx, struct request *rq,
 
 	lockdep_assert_held(&dd->lock);
 
+	/*
+	 * RL request-level priority must run before queue selection so the
+	 * chosen action is reflected in the queue chosen and the insert trace.
+	 * No-op (fixed path) for non-READ and protected requests, or when RL
+	 * is disabled.
+	 */
+	smart_io_rl_classify_request(rq);
 	smart_io_throttle_classify_request(&dd->throttle, rq);
 	prio = (enum dd_prio)smart_io_throttle_select_queue(rq);
 	if (prio == DD_HP_PRIO)

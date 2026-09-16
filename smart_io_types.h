@@ -18,6 +18,12 @@ enum smart_io_file_ext {
 	SMART_IO_FILE_EXT_LOG = 5,
 	SMART_IO_FILE_EXT_VDEX = 6,
 	SMART_IO_FILE_EXT_ODEX = 7,
+	SMART_IO_FILE_EXT_ART = 8,
+	SMART_IO_FILE_EXT_JAR = 9,
+	SMART_IO_FILE_EXT_FONT = 10,
+	SMART_IO_FILE_EXT_META_INODE = 11,
+	SMART_IO_FILE_EXT_NODE_INODE = 12,
+	SMART_IO_FILE_EXT_OTHER = 13,
 };
 
 enum smart_io_thread_role {
@@ -69,6 +75,8 @@ struct smart_io_event {
 	u32 scene_tag;
 	u8 is_front;
 	u8 thread_role;
+	u8 cpu_cgroup_class;
+	u8 sector_class;
 
 	u8 io_op;
 	u32 io_size_kb;
@@ -85,8 +93,14 @@ struct smart_io_event {
 	u64 inode_hash;
 	u64 folio_index;
 
-	u32 io_in_flight;
-	u32 queue_saturate;
+	u32 r_flt;
+	u32 w_flt;
+	u32 r_wait;
+	u32 w_wait;
+	u32 tag_used;
+	u32 tag_max;
+	u32 r_lat_us;
+	u32 w_lat_us;
 	u32 cgroup_io_weight;
 
 	u8 f2fs_gc_active;

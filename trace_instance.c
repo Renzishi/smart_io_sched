@@ -92,7 +92,8 @@ void smart_io_trace_emit_complete(const struct smart_io_event *evt)
 			   "uid=%u scene_tag=%u is_front=%u thread_role=%u "
 			   "io_op=%u io_sz_kb=%u sector=%llu ioprio=%u file_ext=%u file_ext_s=%s "
 			   "fs=%s dev_name=%s remap_from=%s remap_mixed=%u dev_type=%u sync=%u inode=%llu "
-			   "io_inflight=%u queue_sat=%u cg_io_weight=%u gc=%u cp=%u "
+			   "r_flt=%u w_flt=%u r_wait=%u w_wait=%u tag_cur=%u tag_max=%u "
+			   "r_lat_us=%u w_lat_us=%u cg_io_weight=%u gc=%u cp=%u "
 			   "hot_file=%u mem_avail_mb=%u dirty_mb=%u wb_mb=%u swap_mb=%u "
 			   "cpu_loadavg_1m=%u online_cpus=%u runqueue=%u dev_util_pct=%u "
 			   "io_bw_kbps=%u lat_us=%llu sched_us=%llu dev_us=%llu "
@@ -107,7 +108,9 @@ void smart_io_trace_emit_complete(const struct smart_io_event *evt)
 			   evt->file_ext, evt->file_ext_str, evt->fs_type,
 			   evt->dev_name, evt->remap_from, evt->remap_mixed,
 			   evt->device_type, evt->is_sync,
-			   evt->inode_hash, evt->io_in_flight, evt->queue_saturate,
+			   evt->inode_hash, evt->r_flt, evt->w_flt, evt->r_wait,
+			   evt->w_wait, evt->tag_used, evt->tag_max, evt->r_lat_us,
+			   evt->w_lat_us,
 			   evt->cgroup_io_weight, evt->f2fs_gc_active,
 			   evt->f2fs_cp_active, evt->is_hot_file, evt->mem_avail_mb,
 			   evt->dirty_pages_mb, evt->wb_pages_mb, evt->swap_mb,
