@@ -9,6 +9,35 @@
 #define SMART_IO_FS_TYPE_LEN 16
 #define SMART_IO_DEV_NAME_LEN 32
 
+/*
+ * ioprio hint-bit layout (module-global, single source of truth).
+ *
+ * These bits live in the 10-bit ioprio hint field (see IOPRIO_PRIO_HINT).
+ * Both the RL request classifier and the throttle queue selector / bio
+ * markers MUST reference these names; no component may redefine its own
+ * copy of the same bit values.
+ *
+ *   bit3 HP    : route to the high-priority (HP) queue
+ *   bit4 PGF   : source = page fault (page cache fault) read
+ *   bit5 PI    : source = page-in / PI read
+ *   bit6 VIP   : route to the VIP treatment
+ *   bit9 MAIN  : source = foreground app main-thread read
+ *
+ * Route bits (HP/VIP) are decisions that can be cleared (e.g. RA demotion).
+ * Source bits (PGF/PI/MAIN) are I/O-origin markers and are orthogonal to
+ * routing; they are never cleared by a routing decision.
+ * RL action bits (7-8) are defined separately in smart_io_rl.h.
+ */
+#define SMART_IO_HP_IOPRIO_HINT   (1U << 3)
+#define SMART_IO_PGF_IOPRIO_HINT  (1U << 4)
+#define SMART_IO_PI_IOPRIO_HINT   (1U << 5)
+#define SMART_IO_VIP_IOPRIO_HINT  (1U << 6)
+#define SMART_IO_MAIN_IOPRIO_HINT (1U << 9)
+#define SMART_IO_PRIVATE_HINT_MASK \
+	(SMART_IO_HP_IOPRIO_HINT | SMART_IO_PGF_IOPRIO_HINT | \
+	 SMART_IO_PI_IOPRIO_HINT | SMART_IO_VIP_IOPRIO_HINT | \
+	 SMART_IO_MAIN_IOPRIO_HINT)
+
 enum smart_io_file_ext {
 	SMART_IO_FILE_EXT_UNKNOWN = 0,
 	SMART_IO_FILE_EXT_DB = 1,

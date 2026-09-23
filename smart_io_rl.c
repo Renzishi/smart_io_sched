@@ -146,9 +146,9 @@ static bool smart_io_rl_build_state(struct request *rq,
 	extract_device_name(rq, dev_name, sizeof(dev_name));
 	state->is_loop = !strncmp(dev_name, "loop", 4);
 	state->is_pgf = !!(IOPRIO_PRIO_HINT(req_get_ioprio(rq)) &
-				   SMART_IO_RL_PGF_HINT);
+				   SMART_IO_PGF_IOPRIO_HINT);
 	state->is_pi = !!(IOPRIO_PRIO_HINT(req_get_ioprio(rq)) &
-				  SMART_IO_RL_PI_HINT);
+				  SMART_IO_PI_IOPRIO_HINT);
 	return smart_io_throttle_get_rl_device_snapshot(rq, &state->device);
 }
 
@@ -159,7 +159,7 @@ static bool smart_io_rl_build_state(struct request *rq,
  *   RT : set class RT, clear RL-controllable route bits (HP/VIP, keep PGF/PI)
  *         + RL_ACTION_RT
  * Old RL action bits are cleared first so the write is idempotent across
- * requeues. PGF/PI protection bits are never cleared by an RL write.
+ * requeues. PGF/PI/MAIN source bits are never cleared by an RL write.
  */
 static u16 smart_io_rl_encode(u16 ioprio, u8 action)
 {
@@ -170,7 +170,7 @@ static u16 smart_io_rl_encode(u16 ioprio, u8 action)
 	u8 new_class;
 
 	new_hint = old_hint & ~(SMART_IO_RL_ACTION_MASK |
-				       SMART_IO_RL_HP_HINT | SMART_IO_RL_VIP_HINT);
+				       SMART_IO_HP_IOPRIO_HINT | SMART_IO_VIP_IOPRIO_HINT);
 	new_class = ioprio_class;
 	if (new_class == IOPRIO_CLASS_NONE) {
 		new_class = IOPRIO_CLASS_BE;
@@ -179,13 +179,13 @@ static u16 smart_io_rl_encode(u16 ioprio, u8 action)
 
 	if (action == SMART_IO_RL_ACTION_RT) {
 		new_class = IOPRIO_CLASS_RT;
-		new_hint &= ~(SMART_IO_RL_HP_HINT | SMART_IO_RL_VIP_HINT);
+		new_hint &= ~(SMART_IO_HP_IOPRIO_HINT | SMART_IO_VIP_IOPRIO_HINT);
 		new_hint |= (u16)SMART_IO_RL_ACTION_RT << SMART_IO_RL_ACTION_SHIFT;
 	} else if (action == SMART_IO_RL_ACTION_VIP) {
-		new_hint |= SMART_IO_RL_HP_HINT | SMART_IO_RL_VIP_HINT;
+		new_hint |= SMART_IO_HP_IOPRIO_HINT | SMART_IO_VIP_IOPRIO_HINT;
 		new_hint |= (u16)SMART_IO_RL_ACTION_VIP << SMART_IO_RL_ACTION_SHIFT;
 	} else { /* SMART_IO_RL_ACTION_HP */
-		new_hint |= SMART_IO_RL_HP_HINT;
+		new_hint |= SMART_IO_HP_IOPRIO_HINT;
 		new_hint |= (u16)SMART_IO_RL_ACTION_HP << SMART_IO_RL_ACTION_SHIFT;
 	}
 
@@ -223,18 +223,18 @@ int smart_io_rl_decode_action(u16 ioprio)
 	u8 action = (hint & SMART_IO_RL_ACTION_MASK) >>
 		SMART_IO_RL_ACTION_SHIFT;
 	/* PGF/PI are protection bits and are intentionally ignored here. */
-	u16 route = hint & (SMART_IO_RL_HP_HINT | SMART_IO_RL_VIP_HINT);
+	u16 route = hint & (SMART_IO_HP_IOPRIO_HINT | SMART_IO_VIP_IOPRIO_HINT);
 
 	if (!action)
 		return SMART_IO_RL_ACTION_NONE;
 	if (action == SMART_IO_RL_ACTION_VIP)
-		return route == (SMART_IO_RL_HP_HINT | SMART_IO_RL_VIP_HINT) ?
+		return route == (SMART_IO_HP_IOPRIO_HINT | SMART_IO_VIP_IOPRIO_HINT) ?
 			SMART_IO_RL_ACTION_VIP : -EINVAL;
 	if (action == SMART_IO_RL_ACTION_HP)
-		return route == SMART_IO_RL_HP_HINT ? SMART_IO_RL_ACTION_HP : -EINVAL;
+		return route == SMART_IO_HP_IOPRIO_HINT ? SMART_IO_RL_ACTION_HP : -EINVAL;
 	if (action == SMART_IO_RL_ACTION_RT)
 		return IOPRIO_PRIO_CLASS(ioprio) == IOPRIO_CLASS_RT &&
-			!(route & (SMART_IO_RL_HP_HINT | SMART_IO_RL_VIP_HINT)) ?
+			!(route & (SMART_IO_HP_IOPRIO_HINT | SMART_IO_VIP_IOPRIO_HINT)) ?
 			SMART_IO_RL_ACTION_RT : -EINVAL;
 	return -EINVAL;
 }
@@ -244,15 +244,12 @@ int smart_io_rl_decode_action(u16 ioprio)
  * reads VIP is not legal, so it is excluded and the remaining probabilities
  * are used as-is (summed over HP/RT). O(1), per-CPU LCG, no allocation.
  */
-static u8 smart_io_rl_random_action(bool meta_or_rahead)
+static u8 smart_io_rl_random_action(void)
 {
 	u32 vip_pct = (u32)atomic_read(&rl_random_vip_pct);
 	u32 hp_pct = (u32)atomic_read(&rl_random_hp_pct);
 	u32 rt_pct = (u32)atomic_read(&rl_random_rt_pct);
 	u32 total, roll;
-
-	if (meta_or_rahead)
-		vip_pct = 0;
 
 	total = vip_pct + hp_pct + rt_pct;
 	if (!total)
@@ -272,8 +269,6 @@ bool smart_io_rl_classify_request(struct request *rq)
 	u16 ioprio;
 	u16 hint;
 	struct smart_io_rl_state state;
-	bool meta;
-	bool rahead;
 	u8 action;
 
 	if (!rq)
@@ -293,31 +288,23 @@ bool smart_io_rl_classify_request(struct request *rq)
 		return false;
 	}
 
-	/* Protection: PI owner / PGF semantic reads keep the fixed rule. */
 	ioprio = req_get_ioprio(rq);
 	hint = IOPRIO_PRIO_HINT(ioprio);
 	/* Requeues must retain the action selected at first insertion. */
 	if (hint & SMART_IO_RL_ACTION_MASK)
 		return false;
-	if (smart_io_pi_current_marked() ||
-	    (hint & (SMART_IO_RL_PGF_HINT | SMART_IO_RL_PI_HINT))) {
-		atomic_inc(&rl_protected_count);
-		return false;
-	}
+
 	if (!smart_io_rl_build_state(rq, &state)) {
 		atomic_inc(&rl_fallback_count);
 		return false;
 	}
-
-	meta = !!(rq->cmd_flags & REQ_META);
-	rahead = !!(rq->cmd_flags & REQ_RAHEAD);
 
 	if (mode == SMART_IO_RL_MODE_RULE)
 		action = smart_io_rl_rule_action(&state);
 	else if (mode == SMART_IO_RL_MODE_FIXED)
 		action = (u8)atomic_read(&rl_fixed_action);
 	else if (mode == SMART_IO_RL_MODE_RANDOM)
-		action = smart_io_rl_random_action(meta || rahead);
+		action = smart_io_rl_random_action();
 	else {
 		int ret = smart_io_rl_model_action(&state, &action);
 
@@ -326,10 +313,6 @@ bool smart_io_rl_classify_request(struct request *rq)
 			return false;
 		}
 	}
-
-	/* META/RAHEAD legal set excludes VIP: clamp VIP -> HP (not a fallback). */
-	if ((meta || rahead) && action == SMART_IO_RL_ACTION_VIP)
-		action = SMART_IO_RL_ACTION_HP;
 
 	/* Invalid action (e.g. bad fixed-action knob) falls back to fixed path. */
 	if (action != SMART_IO_RL_ACTION_VIP &&

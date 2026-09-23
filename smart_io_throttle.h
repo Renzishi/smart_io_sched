@@ -161,6 +161,8 @@ struct smart_io_throttle_ctx {
 
 	u32 current_depth; /* dispatch to requeue/final complete */
 	u32 bg_current_depth; /* background dispatch to final complete */
+	u32 rt_current_depth;  /* RT dispatch to requeue/final complete */
+	u32 be_current_depth;  /* BE dispatch to requeue/final complete */
 	u32 issued_depth; /* issue to requeue/final complete */
 	u32 pending_fg;
 	u32 pending_bg;
@@ -304,7 +306,7 @@ void smart_io_throttle_mark_bio_hp(struct bio *bio);
 void smart_io_throttle_mark_bio_vip(struct bio *bio);
 void smart_io_throttle_mark_bio_pgf(struct bio *bio);
 void smart_io_throttle_mark_bio_pi(struct bio *bio);
-void smart_io_throttle_mark_request_hp(struct request *rq);
+void smart_io_throttle_mark_bio_rt(struct bio *bio);
 bool smart_io_throttle_request_is_vip(const struct request *rq);
 u64 smart_io_throttle_request_id(const struct request *rq);
 int smart_io_throttle_set_ux_hp_enable(bool enabled);
@@ -321,7 +323,8 @@ void smart_io_throttle_dispatch_model_if_needed(
 		struct smart_io_throttle_ctx *ctx);
 bool smart_io_throttle_model_dispatch_needed(
 		struct smart_io_throttle_ctx *ctx);
-bool smart_io_throttle_non_hp_allowed(struct smart_io_throttle_ctx *ctx);
+bool smart_io_throttle_non_hp_allowed(struct smart_io_throttle_ctx *ctx,
+				      enum smart_io_queue_class queue_class);
 bool smart_io_throttle_deadline_escape_available(
 		struct smart_io_throttle_ctx *ctx);
 bool smart_io_throttle_background_deadline_expired(

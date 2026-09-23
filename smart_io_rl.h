@@ -28,17 +28,14 @@ struct smart_io_rl_device_snapshot {
  * by the 12-action throttle model, bits 3-6); they are only parsed offline
  * from the final ioprio recorded by block_rq_insert. See
  * docs/RL-per-request优先级-排采集前置设计稿.md for the full spec.
+ *
+ * The route/source hint bits (HP/PGF/PI/VIP/MAIN, bits 3-6 and 9) are NOT
+ * defined here; they come from smart_io_types.h (SMART_IO_*_IOPRIO_HINT),
+ * the module's single source of truth. This file only adds the RL-action
+ * bits (7-8) on top.
  */
 
-/*
- * Route bits used by the 12-action throttle model (bits 3-6 of the hint
- * field). Shared here so the RL encoder and the queue selector agree on the
- * values; they must stay in sync with smart_io_throttle.c.
- */
-#define SMART_IO_RL_HP_HINT  (1U << 3)
-#define SMART_IO_RL_PGF_HINT (1U << 4)
-#define SMART_IO_RL_PI_HINT  (1U << 5)
-#define SMART_IO_RL_VIP_HINT (1U << 6)
+#include "smart_io_types.h"
 
 #define SMART_IO_RL_ACTION_SHIFT 7
 #define SMART_IO_RL_ACTION_MASK \

@@ -900,9 +900,9 @@ static struct request *dd_dispatch_request(struct blk_mq_hw_ctx *hctx)
 	smart_io_throttle_dispatch_model_if_needed(&dd->throttle);
 	spin_lock(&dd->lock);
 	rq = dd_dispatch_fifo(dd, &dd->per_prio[DD_HP_PRIO]);
-	if (!rq && smart_io_throttle_non_hp_allowed(&dd->throttle))
+	if (!rq && smart_io_throttle_non_hp_allowed(&dd->throttle, SMART_IO_QUEUE_RT))
 		rq = dd_dispatch_fifo(dd, &dd->per_prio[DD_RT_PRIO]);
-	if (!rq && smart_io_throttle_non_hp_allowed(&dd->throttle))
+	if (!rq && smart_io_throttle_non_hp_allowed(&dd->throttle, SMART_IO_QUEUE_BE))
 		rq = dd_dispatch_fifo(dd, &dd->per_prio[DD_BE_PRIO]);
 	if (rq)
 		smart_io_throttle_account_dispatch(&dd->throttle, rq, selection);
@@ -1122,8 +1122,6 @@ static void dd_insert_request(struct blk_mq_hw_ctx *hctx, struct request *rq,
 	smart_io_rl_classify_request(rq);
 	smart_io_throttle_classify_request(&dd->throttle, rq);
 	prio = (enum dd_prio)smart_io_throttle_select_queue(rq);
-	if (prio == DD_HP_PRIO)
-		smart_io_throttle_mark_request_hp(rq);
 	per_prio = &dd->per_prio[prio];
 	if (!rq->elv.priv[0])
 		per_prio->stats.inserted++;
@@ -1230,7 +1228,8 @@ static bool dd_has_work(struct blk_mq_hw_ctx *hctx)
 	    !dd_has_work_for_prio(&dd->per_prio[DD_BE_PRIO]))
 		return false;
 
-	return smart_io_throttle_non_hp_allowed(&dd->throttle);
+	return smart_io_throttle_non_hp_allowed(&dd->throttle, SMART_IO_QUEUE_RT) ||
+		smart_io_throttle_non_hp_allowed(&dd->throttle, SMART_IO_QUEUE_BE);
 }
 
 /*
