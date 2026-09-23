@@ -79,11 +79,12 @@ u8 match_thread_role(uid_t uid, pid_t pid, pid_t tid, const char *comm, uid_t fg
 	}
 
 	if (uid >= 10000) {
-		if (strstr(comm, "RenderThread") || strstr(comm, "GLThread") ||
-		    !strcmp(comm, "main"))
-			return ROLE_UX;
-		if (uid == fg_uid)
+		if (uid == fg_uid) {
+			if (strstr(comm, "RenderThread") || strstr(comm, "GLThread") ||
+				pid == tid)
+				return ROLE_UX;
 			return ROLE_FRONT;
+		}
 		return ROLE_BACK;
 	}
 

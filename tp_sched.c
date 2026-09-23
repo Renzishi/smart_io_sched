@@ -11,15 +11,17 @@
 #include "trace_instance.h"
 #include "tool.h"
 
-static bool fg_main_pid_matches(pid_t pid)
+static bool fg_main_thread_matches(struct task_struct *task)
 {
-	pid_t fg_pid;
-
-	if (atomic_read(&rawdata_trace_enabled) == 0 || pid <= 0)
+	if (atomic_read(&rawdata_trace_enabled) == 0)
 		return false;
+	
+	int fg_uid = smart_io_get_fg_uid();
+	u32 uid = from_kuid(&init_user_ns, task->cred->uid);
 
-	fg_pid = (pid_t)smart_io_get_fg_main_pid();
-	return fg_pid > 0 && fg_pid == pid;
+	if (fg_uid < 0) return false;
+
+	return fg_uid == uid ? task->pid == task->tgid : false;
 }
 
 static void tp_sched_switch_cb(void *ignore, bool preempt,
@@ -37,7 +39,7 @@ static void tp_sched_switch_cb(void *ignore, bool preempt,
 	/* Only log when the fg main thread gives up the cpu because of a
 	 * blocking state (S/D); preemption (prev_state == RUNNING) is skipped.
 	 */
-	if (!fg_main_pid_matches(prev->pid))
+	if (!fg_main_thread_matches(prev))
 		return;
 	if (!(prev_state & (TASK_INTERRUPTIBLE | TASK_UNINTERRUPTIBLE)))
 		return;
@@ -61,7 +63,7 @@ static void tp_sched_wakeup_cb(void *ignore, struct task_struct *task)
 	 * (The kernel only passes the woken task to sched_wakeup; current is
 	 * the best approximation of the waker. It equals task on self-wakeup.)
 	 */
-	if (!task || !fg_main_pid_matches(task->pid))
+	if (!task || !fg_main_thread_matches(task))
 		return;
 
 	smart_io_raw_emit("sched_wakeup: ts=%llu "

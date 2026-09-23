@@ -23,8 +23,8 @@ static void tp_bio_queue_cb(void *ignore, struct bio *bio)
 
 	if (smart_io_filemap_fault_active())
 		smart_io_throttle_mark_bio_pgf(bio);
-	else
-		smart_io_throttle_mark_bio_hp(bio);
+	smart_io_throttle_mark_bio_rt(bio);
+	smart_io_throttle_mark_bio_hp(bio);
 	smart_io_throttle_mark_bio_pi(bio);
 	smart_io_throttle_mark_bio_vip(bio);
 }

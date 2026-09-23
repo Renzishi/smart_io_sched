@@ -3,6 +3,7 @@
 #include <linux/mutex.h>
 #include <linux/rtmutex.h>
 #include <linux/tracepoint.h>
+#include <linux/user_namespace.h>
 #include <trace/hooks/dtask.h>
 
 #include "smart_io_log.h"
@@ -11,6 +12,16 @@
 #include "trace_instance.h"
 
 static atomic_t smart_io_pi_owner_pid = ATOMIC_INIT(0);
+
+static bool smart_io_pi_current_is_fg_main(void)
+{
+	int fg_uid = smart_io_get_fg_uid();
+	uid_t uid = from_kuid(&init_user_ns, current_uid());
+
+	return fg_uid >= 0 &&
+		uid == (uid_t)fg_uid &&
+		current->pid == current->tgid;
+}
 
 static struct task_struct *smart_io_pi_mutex_owner(struct mutex *lock)
 {
@@ -73,7 +84,7 @@ static void smart_io_pi_mutex_start(void *ignore, struct mutex *lock)
 	struct task_struct *owner;
 
 	(void)ignore;
-	if (current->pid != smart_io_get_fg_main_pid())
+	if (!smart_io_pi_current_is_fg_main())
 		return;
 
 	owner = smart_io_pi_mutex_owner(lock);
@@ -84,7 +95,7 @@ static void smart_io_pi_mutex_finish(void *ignore, struct mutex *lock)
 {
 	(void)ignore;
 	(void)lock;
-	if (current->pid == smart_io_get_fg_main_pid())
+	if (smart_io_pi_current_is_fg_main())
 		smart_io_pi_clear_owner("mutex_wait_finish");
 }
 
@@ -94,7 +105,7 @@ static void smart_io_pi_rtmutex_start(void *ignore,
 	struct task_struct *owner;
 
 	(void)ignore;
-	if (current->pid != smart_io_get_fg_main_pid())
+	if (!smart_io_pi_current_is_fg_main())
 		return;
 
 	owner = smart_io_pi_rtmutex_owner(lock);
