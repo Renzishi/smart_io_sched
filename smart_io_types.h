@@ -110,7 +110,7 @@ struct smart_io_event {
 	u8 io_op;
 	u32 io_size_kb;
 	u64 sector;
-	u16 ioprio_class;
+	u16 ioprio;
 	u16 file_ext;
 	char file_ext_str[SMART_IO_FILE_EXT_STR_LEN];
 	char fs_type[SMART_IO_FS_TYPE_LEN];

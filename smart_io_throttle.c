@@ -31,6 +31,7 @@
 #include "system_context.h"
 #include "tp_pi.h"
 #include "trace_instance.h"
+#include "tool.h"
 
 // #define SMART_IO_DEFAULT_DEV_LAT_US 4000U
 // #define SMART_IO_DEFAULT_DEV_LAT_US 1000U
@@ -237,29 +238,6 @@ smart_io_throttle_queue_from_ioprio(u16 ioprio)
 		SMART_IO_QUEUE_RT : SMART_IO_QUEUE_BE;
 }
 
-static bool smart_io_throttle_current_uid_is_fg(void)
-{
-	int fg_uid = smart_io_get_fg_uid();
-	u32 uid = from_kuid(&init_user_ns, current_uid());
-
-	return fg_uid >= 0 && uid == (u32)fg_uid;
-}
-
-static bool smart_io_throttle_current_is_fg_main(void)
-{
-	return smart_io_throttle_current_uid_is_fg() &&
-		current->pid == current->tgid;
-}
-
-static bool smart_io_throttle_current_is_ux(void)
-{
-	if (!smart_io_throttle_current_is_fg_main())
-		return false;
-
-	return strstr(current->comm, "RenderThread") ||
-			strstr(current->comm, "GLThread");
-}
-
 static bool smart_io_throttle_special_read(u16 ioprio, blk_opf_t opf,
 					   unsigned int op)
 {
@@ -270,7 +248,7 @@ static bool smart_io_throttle_special_read(u16 ioprio, blk_opf_t opf,
 static bool smart_io_throttle_current_can_mark_hp(u16 ioprio,
 						  blk_opf_t opf, unsigned int op)
 {
-	return smart_io_throttle_current_is_ux() ||
+	return current_is_ux() ||
 		smart_io_throttle_special_read(ioprio, opf, op);
 }
 
@@ -278,7 +256,7 @@ static bool smart_io_throttle_current_can_mark_vip(u16 ioprio,
 						   blk_opf_t opf,
 						   unsigned int op)
 {
-	return smart_io_throttle_current_is_ux() &&
+	return current_is_ux() &&
 		smart_io_throttle_special_read(ioprio, opf, op);
 }
 
@@ -351,7 +329,7 @@ smart_io_throttle_select_bio_queue(const struct bio *bio)
 
 void smart_io_throttle_mark_bio_rt(struct bio *bio)
 {
-	if (!smart_io_throttle_current_uid_is_fg())
+	if (!current_uid_is_fg())
 		return;
 	if (smart_io_throttle_is_smart_ioprio(bio->bi_ioprio))
 		return;
@@ -387,14 +365,14 @@ void smart_io_throttle_mark_bio_pgf(struct bio *bio)
 void smart_io_throttle_mark_bio_pi(struct bio *bio)
 {
 	u16 hint = 0;
-	if (!smart_io_pi_current_marked() && !smart_io_throttle_current_is_fg_main())
+	if (!smart_io_pi_current_marked() && !current_is_fg_main())
 		return;
 
 	if (smart_io_pi_current_marked())
 		hint |= SMART_IO_HP_IOPRIO_HINT |
 			SMART_IO_PI_IOPRIO_HINT | SMART_IO_VIP_IOPRIO_HINT;
 
-	if (smart_io_throttle_current_is_fg_main())
+	if (current_is_fg_main())
 		hint |= SMART_IO_MAIN_IOPRIO_HINT;
 
 	if (hint)

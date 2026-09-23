@@ -422,10 +422,7 @@ static void smart_io_mark_hot_inode(u64 inode_hash, u16 file_ext)
 	int expired_idx = -1;
 	int i;
 
-	if (!inode_hash ||
-	    (file_ext != SMART_IO_FILE_EXT_APK &&
-	     file_ext != SMART_IO_FILE_EXT_ODEX &&
-	     file_ext != SMART_IO_FILE_EXT_VDEX))
+	if (!inode_hash)
 		return;
 
 	now_ns = ktime_get_boottime_ns();
@@ -499,8 +496,7 @@ static bool smart_io_is_hot_read_candidate(const struct smart_io_event *event)
 	    event->file_ext != SMART_IO_FILE_EXT_VDEX)
 		return false;
 
-	return event->is_front &&
-		current->pid == smart_io_get_fg_main_pid();
+	return current_is_fg_main() || (IOPRIO_PRIO_HINT(event->ioprio) & SMART_IO_MAIN_IOPRIO_HINT);
 }
 
 static u8 snapshot_device_util(void)
@@ -652,7 +648,7 @@ static void emit_raw_insert(const struct smart_io_event *evt,
 			  "r_flt=%u w_flt=%u r_wait=%u w_wait=%u "
 			  "r_lat_us=%u w_lat_us=%u sector_class=%u runqueue=%u\n",
 			  evt->ts_insert, evt->uid, current->pid, current->tgid, (void *)rq,
-			  blk_rq_bytes(rq), rq->cmd_flags, evt->sector, evt->ioprio_class,
+			  blk_rq_bytes(rq), rq->cmd_flags, evt->sector, evt->ioprio,
 			  evt->file_ext, evt->file_ext_str, evt->is_front,
 			  evt->thread_role, evt->cpu_cgroup_class,
 			  evt->fs_type,
@@ -692,7 +688,7 @@ static void emit_raw_issue(const struct smart_io_event *evt,
 				  "tag_max=%u tag_cur=%u direct=1\n",
 				  evt->ts_issue, evt->uid, current->pid, current->tgid,
 				  (void *)rq, blk_rq_bytes(rq), rq->cmd_flags, evt->sector,
-				  evt->ioprio_class, evt->file_ext, evt->file_ext_str, evt->is_front,
+				  evt->ioprio, evt->file_ext, evt->file_ext_str, evt->is_front,
 				  evt->thread_role, evt->fs_type, evt->dev_name, evt->remap_from,
 				  evt->remap_mixed, evt->inode_hash, evt->folio_index,
 				  nr_bio, tag_max, tag_used);
@@ -780,7 +776,7 @@ static void fill_record_from_current(struct rq_record *rec, struct request *rq,
 	rec->data_bytes = blk_rq_bytes(rq);
 	evt->io_size_kb = blk_rq_bytes(rq) >> 10;
 	evt->sector = blk_rq_pos(rq);
-	evt->ioprio_class = req_get_ioprio(rq);
+	evt->ioprio = req_get_ioprio(rq);
 	evt->sector_class = smart_io_throttle_get_rl_sector_class(rq);
 
 	if (evt->thread_role == ROLE_FIO)
@@ -986,7 +982,7 @@ void smart_io_record_insert(struct request *rq)
 			rec->event.io_op, old->event.io_op,
 			rec->event.io_size_kb, old->event.io_size_kb,
 			rec->event.sector, old->event.sector,
-			rec->event.ioprio_class, old->event.ioprio_class,
+			rec->event.ioprio, old->event.ioprio,
 			rec->event.file_ext, old->event.file_ext,
 			rec->event.inode_hash, old->event.inode_hash);
 		kmem_cache_free(rq_record_cache, old);

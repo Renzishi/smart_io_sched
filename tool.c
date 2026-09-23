@@ -16,6 +16,7 @@
 
 #include "smart_io_types.h"
 #include "tool.h"
+#include "system_context.h"
 
 u32 pages_to_mb(unsigned long pages)
 {
@@ -89,6 +90,27 @@ u8 match_thread_role(uid_t uid, pid_t pid, pid_t tid, const char *comm, uid_t fg
 	}
 
 	return ROLE_UNKNOWN;
+}
+
+bool current_uid_is_fg(void)
+{
+	int uid = smart_io_get_fg_uid();
+	return uid >= 0 && from_kuid(&init_user_ns, current_uid()) == (u32)uid;
+}
+
+bool current_is_fg_main(void)
+{
+	return current_uid_is_fg() &&
+		current->pid == current->tgid;
+}
+
+bool current_is_ux(void)
+{
+	if (!current_is_fg_main())
+		return false;
+
+	return strstr(current->comm, "RenderThread") ||
+			strstr(current->comm, "GLThread");
 }
 
 u32 kb_window_to_kbps(u64 kb, u32 window_ms)
