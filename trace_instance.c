@@ -104,7 +104,7 @@ void smart_io_trace_emit_complete(const struct smart_io_event *evt)
 			   "cache_hit=%u file_access_pages=%llu file_miss_pages=%llu file_cache_add_pages=%llu file_cache_delete_pages=%llu file_refault_pages=%llu file_fault_count=%llu file_fault_wait_us=%llu direct=%u\n",
 			   evt->ts_insert, evt->ts_issue, evt->ts_complete,
 			   evt->uid, evt->scene_tag, evt->is_front, evt->thread_role,
-			   evt->io_op, evt->io_size_kb, evt->sector, evt->ioprio_class,
+			   evt->io_op, evt->io_size_kb, evt->sector, evt->ioprio,
 			   evt->file_ext, evt->file_ext_str, evt->fs_type,
 			   evt->dev_name, evt->remap_from, evt->remap_mixed,
 			   evt->device_type, evt->is_sync,

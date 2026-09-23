@@ -239,11 +239,6 @@ int smart_io_rl_decode_action(u16 ioprio)
 	return -EINVAL;
 }
 
-/*
- * Random exploration within the legal action set (doc §9.C). For META/RAHEAD
- * reads VIP is not legal, so it is excluded and the remaining probabilities
- * are used as-is (summed over HP/RT). O(1), per-CPU LCG, no allocation.
- */
 static u8 smart_io_rl_random_action(void)
 {
 	u32 vip_pct = (u32)atomic_read(&rl_random_vip_pct);

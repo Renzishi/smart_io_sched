@@ -7,6 +7,7 @@
 #include "smart_io_log.h"
 #include "smart_io_throttle.h"
 #include "smart_io_types.h"
+#include "smart_io_prio_policy.h"
 #include "tp_filemap.h"
 #include "tp_pi.h"
 #include "trace_instance.h"
@@ -21,12 +22,7 @@ static void tp_bio_queue_cb(void *ignore, struct bio *bio)
 	if (!bio || bio_op(bio) != REQ_OP_READ)
 		return;
 
-	if (smart_io_filemap_fault_active())
-		smart_io_throttle_mark_bio_pgf(bio);
-	smart_io_throttle_mark_bio_rt(bio);
-	smart_io_throttle_mark_bio_hp(bio);
-	smart_io_throttle_mark_bio_pi(bio);
-	smart_io_throttle_mark_bio_vip(bio);
+	smart_io_mark_bio_hint(bio);
 }
 
 static void tp_rq_issue_cb(void *ignore, struct request *rq)

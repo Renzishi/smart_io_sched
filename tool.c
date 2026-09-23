@@ -106,11 +106,8 @@ bool current_is_fg_main(void)
 
 bool current_is_ux(void)
 {
-	if (!current_is_fg_main())
-		return false;
-
-	return strstr(current->comm, "RenderThread") ||
-			strstr(current->comm, "GLThread");
+	return current_is_fg_main() || (strstr(current->comm, "RenderThread") ||
+			strstr(current->comm, "GLThread"));
 }
 
 u32 kb_window_to_kbps(u64 kb, u32 window_ms)

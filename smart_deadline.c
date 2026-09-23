@@ -27,6 +27,7 @@
 #include "smart_deadline.h"
 #include "smart_io_rl.h"
 #include "smart_io_throttle.h"
+#include "smart_io_prio_policy.h"
 
 /*
  * See Documentation/block/deadline-iosched.rst
@@ -822,12 +823,12 @@ static struct request *dd_dispatch_fifo(struct deadline_data *dd,
 		vip_read_rq = list_first_entry_or_null(
 			&per_prio->fifo_list[DD_READ], struct request, queuelist);
 		if (vip_read_rq &&
-		    !smart_io_throttle_request_is_vip(vip_read_rq))
+		    !is_vip_request(vip_read_rq))
 			vip_read_rq = NULL;
 		vip_write_rq = list_first_entry_or_null(
 			&per_prio->fifo_list[DD_WRITE], struct request, queuelist);
 		if (vip_write_rq &&
-		    !smart_io_throttle_request_is_vip(vip_write_rq))
+		    !is_vip_request(vip_write_rq))
 			vip_write_rq = NULL;
 		if (vip_read_rq || vip_write_rq) {
 			if (!vip_read_rq)
@@ -876,7 +877,7 @@ static void dd_insert_fifo_request(struct dd_per_prio *per_prio,
 {
 	struct list_head *head = &per_prio->fifo_list[data_dir];
 
-	if (!smart_io_throttle_request_is_vip(rq)) {
+	if (!is_vip_request(rq)) {
 		list_add_tail(&rq->queuelist, head);
 		return;
 	}

@@ -21,6 +21,7 @@
 #include "system_context.h"
 #include "tp_filemap.h"
 #include "trace_instance.h"
+#include "tool.h"
 
 #define FILEMAP_PGF_TASK_HASH_BITS 6
 
@@ -319,7 +320,7 @@ static void tp_filemap_fault_start_cb(void *ignore, struct file *file,
 	(void)file;
 	(void)pgoff;
 
-	if (current->pid != smart_io_get_fg_main_pid())
+	if (current_is_fg_main())
 		return;
 
 	spin_lock_irqsave(&filemap_pgf_task_lock, flags);
@@ -386,7 +387,7 @@ bool smart_io_filemap_fault_active(void)
 	unsigned long flags;
 	bool active;
 
-	if (current->pid != smart_io_get_fg_main_pid())
+	if (current_is_fg_main())
 		return false;
 
 	spin_lock_irqsave(&filemap_pgf_task_lock, flags);

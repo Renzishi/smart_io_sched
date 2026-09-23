@@ -808,7 +808,7 @@ static int event_show(struct seq_file *m, void *v)
 		   "time_to_input_response:%u cache_hit:%u file_access_pages:%llu file_miss_pages:%llu file_cache_add_pages:%llu file_cache_delete_pages:%llu file_refault_pages:%llu file_fault_count:%llu file_fault_wait_us:%llu\n",
 		   e.ts_insert, e.ts_issue, e.ts_complete,
 		   e.uid, e.scene_tag, e.is_front, e.thread_role,
-		   e.io_op, e.io_size_kb, e.sector, e.ioprio_class, e.file_ext,
+		   e.io_op, e.io_size_kb, e.sector, e.ioprio, e.file_ext,
 		   e.file_ext_str, e.fs_type, e.dev_name, e.remap_from,
 		   e.remap_mixed, e.device_type,
 		   e.r_flt, e.w_flt, e.r_wait, e.w_wait, e.tag_used, e.tag_max,

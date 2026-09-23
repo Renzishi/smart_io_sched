@@ -28,6 +28,7 @@
 #include "smart_io_rl.h"
 #include "smart_io_throttle.h"
 #include "smart_io_types.h"
+#include "smart_io_prio_policy.h"
 #include "system_context.h"
 #include "tp_pi.h"
 #include "trace_instance.h"
@@ -170,32 +171,6 @@ static bool smart_io_throttle_device_time_excluded(const struct request *rq,
 	return !strncmp(dev_name, "loop", 4);
 }
 
-static bool smart_io_throttle_is_hp_ioprio(u16 ioprio)
-{
-	return IOPRIO_PRIO_HINT(ioprio) & SMART_IO_HP_IOPRIO_HINT;
-}
-
-static bool smart_io_throttle_is_vip_ioprio(u16 ioprio)
-{
-	return IOPRIO_PRIO_HINT(ioprio) &
-		(SMART_IO_PGF_IOPRIO_HINT | SMART_IO_PI_IOPRIO_HINT |
-		 SMART_IO_VIP_IOPRIO_HINT);
-}
-
-static bool smart_io_throttle_is_smart_ioprio(u16 ioprio)
-{
-	u16 hint = IOPRIO_PRIO_HINT(ioprio);
-
-	return hint & SMART_IO_PRIVATE_HINT_MASK;
-}
-
-bool smart_io_throttle_request_is_vip(const struct request *rq)
-{
-	return rq && req_op((struct request *)rq) == REQ_OP_READ &&
-		smart_io_throttle_is_vip_ioprio(
-			req_get_ioprio((struct request *)rq));
-}
-
 u64 smart_io_throttle_request_id(const struct request *rq)
 {
 	struct smart_io_rq_meta *meta;
@@ -206,58 +181,11 @@ u64 smart_io_throttle_request_id(const struct request *rq)
 	return meta ? READ_ONCE(meta->rq_id) : 0;
 }
 
-static bool smart_io_throttle_is_official_hint(u16 hint)
-{
-	return hint >= IOPRIO_HINT_DEV_DURATION_LIMIT_1 &&
-		hint <= IOPRIO_HINT_DEV_DURATION_LIMIT_7;
-}
-
-static u16 smart_io_throttle_set_private_hint(u16 ioprio, u16 hint)
-{
-	u8 ioprio_class = IOPRIO_PRIO_CLASS(ioprio);
-	u16 old_hint = IOPRIO_PRIO_HINT(ioprio);
-
-	if (smart_io_throttle_is_official_hint(old_hint))
-		return ioprio;
-
-	if (ioprio_class > IOPRIO_CLASS_IDLE)
-		return ioprio;
-	if (ioprio_class == IOPRIO_CLASS_NONE) {
-		ioprio_class = IOPRIO_CLASS_BE;
-		ioprio = IOPRIO_PRIO_VALUE(IOPRIO_CLASS_BE, IOPRIO_BE_NORM);
-	}
-
-	return IOPRIO_PRIO_VALUE_HINT(ioprio_class,
-		IOPRIO_PRIO_LEVEL(ioprio), old_hint | hint);
-}
-
 static enum smart_io_queue_class
 smart_io_throttle_queue_from_ioprio(u16 ioprio)
 {
 	return IOPRIO_PRIO_CLASS(ioprio) == IOPRIO_CLASS_RT ?
 		SMART_IO_QUEUE_RT : SMART_IO_QUEUE_BE;
-}
-
-static bool smart_io_throttle_special_read(u16 ioprio, blk_opf_t opf,
-					   unsigned int op)
-{
-	return (IOPRIO_PRIO_CLASS(ioprio) == IOPRIO_CLASS_RT ||
-		 (opf & (REQ_PRIO | REQ_META | REQ_SYNC)));
-}
-
-static bool smart_io_throttle_current_can_mark_hp(u16 ioprio,
-						  blk_opf_t opf, unsigned int op)
-{
-	return current_is_ux() ||
-		smart_io_throttle_special_read(ioprio, opf, op);
-}
-
-static bool smart_io_throttle_current_can_mark_vip(u16 ioprio,
-						   blk_opf_t opf,
-						   unsigned int op)
-{
-	return current_is_ux() &&
-		smart_io_throttle_special_read(ioprio, opf, op);
 }
 
 enum smart_io_queue_class
@@ -278,7 +206,7 @@ smart_io_throttle_select_queue(const struct request *rq)
 		return meta->queue_class;
 	op = req_op((struct request *)rq);
 	if (op_is_write(op))
-		return smart_io_throttle_is_smart_ioprio(ioprio) ?
+		return has_smart_ioprio_hint(ioprio) ?
 			SMART_IO_QUEUE_RT : SMART_IO_QUEUE_BE;
 
 	/*
@@ -300,8 +228,7 @@ smart_io_throttle_select_queue(const struct request *rq)
 	 * MAIN) are set at bio time by mark_bio_* and carried into the request
 	 * via rq->ioprio. No re-derivation from current thread context.
 	 */
-	if (smart_io_throttle_is_hp_ioprio(ioprio) ||
-	    smart_io_throttle_is_smart_ioprio(ioprio))
+	if (is_hp_ioprio(ioprio) || is_vip_ioprio(ioprio))
 		return SMART_IO_QUEUE_HP;
 
 	return smart_io_throttle_queue_from_ioprio(ioprio);
@@ -313,71 +240,18 @@ smart_io_throttle_select_bio_queue(const struct bio *bio)
 	if (!bio)
 		return SMART_IO_QUEUE_BE;
 	if (op_is_write(bio_op(bio)))
-		return smart_io_throttle_is_smart_ioprio(bio->bi_ioprio) ?
+		return has_smart_ioprio_hint(bio->bi_ioprio) ?
 			SMART_IO_QUEUE_RT : SMART_IO_QUEUE_BE;
 	/*
 	 * Hint bits are set at bio-queue time by tp_bio_queue_cb (block_bio_queue
 	 * tracepoint), so by the time we reach dd_request_merge the bio already
 	 * carries its final source markers. No re-derivation from current.
 	 */
-	if (smart_io_throttle_is_hp_ioprio(bio->bi_ioprio) ||
-	    smart_io_throttle_is_smart_ioprio(bio->bi_ioprio))
+	if (is_hp_ioprio(bio->bi_ioprio) ||
+	    has_smart_ioprio_hint(bio->bi_ioprio))
 		return SMART_IO_QUEUE_HP;
 
 	return smart_io_throttle_queue_from_ioprio(bio->bi_ioprio);
-}
-
-void smart_io_throttle_mark_bio_rt(struct bio *bio)
-{
-	if (!current_uid_is_fg())
-		return;
-	if (smart_io_throttle_is_smart_ioprio(bio->bi_ioprio))
-		return;
-
-	bio->bi_ioprio = IOPRIO_PRIO_VALUE(IOPRIO_CLASS_RT, 0);
-}
-
-void smart_io_throttle_mark_bio_hp(struct bio *bio)
-{
-	if (!smart_io_throttle_current_can_mark_hp(bio->bi_ioprio,
-							 bio->bi_opf, bio_op(bio)))
-		return;
-
-	bio->bi_ioprio = smart_io_throttle_set_private_hint(bio->bi_ioprio,
-		SMART_IO_HP_IOPRIO_HINT);
-}
-
-void smart_io_throttle_mark_bio_vip(struct bio *bio)
-{
-	if (!smart_io_throttle_current_can_mark_vip(bio->bi_ioprio, bio->bi_opf, bio_op(bio)))
-		return;
-
-	bio->bi_ioprio = smart_io_throttle_set_private_hint(
-		bio->bi_ioprio, SMART_IO_VIP_IOPRIO_HINT);
-}
-
-void smart_io_throttle_mark_bio_pgf(struct bio *bio)
-{
-	bio->bi_ioprio = smart_io_throttle_set_private_hint(bio->bi_ioprio,
-		SMART_IO_PGF_IOPRIO_HINT);
-}
-
-void smart_io_throttle_mark_bio_pi(struct bio *bio)
-{
-	u16 hint = 0;
-	if (!smart_io_pi_current_marked() && !current_is_fg_main())
-		return;
-
-	if (smart_io_pi_current_marked())
-		hint |= SMART_IO_HP_IOPRIO_HINT |
-			SMART_IO_PI_IOPRIO_HINT | SMART_IO_VIP_IOPRIO_HINT;
-
-	if (current_is_fg_main())
-		hint |= SMART_IO_MAIN_IOPRIO_HINT;
-
-	if (hint)
-		bio->bi_ioprio = smart_io_throttle_set_private_hint(
-			bio->bi_ioprio, hint);
 }
 
 int smart_io_throttle_set_ux_hp_enable(bool enabled)
