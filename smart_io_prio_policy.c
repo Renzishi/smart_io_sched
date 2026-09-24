@@ -1,6 +1,8 @@
 #include <linux/ioprio.h>
 
 #include "smart_io_prio_policy.h"
+#include "smart_io_rl.h"
+#include "linux/blk_types.h"
 #include "system_context.h"
 #include "tp_pi.h"
 #include "tp_filemap.h"
@@ -64,7 +66,7 @@ static bool is_special_read(u16 ioprio, blk_opf_t opf,
 static bool current_can_mark_hp(u16 ioprio,
 						  blk_opf_t opf, unsigned int op)
 {
-	return current_is_ux() ||
+	return smart_io_rl_cpu_cgroup_class() == SMART_IO_RL_CGROUP_TOP_APP ||
 		is_special_read(ioprio, opf, op);
 }
 
@@ -76,8 +78,7 @@ static bool current_can_mark_vip(u16 ioprio,
 	if (hint & (SMART_IO_PGF_IOPRIO_HINT | SMART_IO_PI_IOPRIO_HINT))
 		return true;
 
-	return current_is_ux() &&
-		is_special_read(ioprio, opf, op);
+	return current_is_ux();
 }
 
 void mark_bio_rt(struct bio *bio)
