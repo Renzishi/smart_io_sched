@@ -1,5 +1,6 @@
 #include <linux/ioprio.h>
 
+#include "block_helper.h"
 #include "smart_io_prio_policy.h"
 #include "smart_io_rl.h"
 #include "linux/blk_types.h"
@@ -72,9 +73,14 @@ static bool current_can_mark_hp(u16 ioprio,
 
 static bool current_can_mark_vip(u16 ioprio,
 						   blk_opf_t opf,
-						   unsigned int op)
+						   unsigned int op,
+						   u64 ino)
 {
 	u16 hint = IOPRIO_PRIO_HINT(ioprio);
+
+	if ((opf & REQ_RAHEAD) && ino != 1 && ino != 2)
+		return false;
+
 	if (hint & (SMART_IO_PGF_IOPRIO_HINT | SMART_IO_PI_IOPRIO_HINT))
 		return true;
 
@@ -101,7 +107,7 @@ void mark_bio_hp(struct bio *bio)
 
 void mark_bio_vip(struct bio *bio)
 {
-	if (!current_can_mark_vip(bio->bi_ioprio, bio->bi_opf, bio_op(bio)))
+	if (!current_can_mark_vip(bio->bi_ioprio, bio->bi_opf, bio_op(bio), extract_bio_ino(bio)))
 		return;
 
 	bio->bi_ioprio = set_private_hint(

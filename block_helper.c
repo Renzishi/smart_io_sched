@@ -377,3 +377,32 @@ u16 extract_first_bio_file_ext(struct bio *bio)
 	rcu_read_unlock();
 	return ext_id;
 }
+
+u64 extract_bio_ino(struct bio *bio)
+{
+	struct page *page;
+	struct folio *folio;
+	struct address_space *mapping;
+	struct inode *inode;
+
+	if (!bio_has_data(bio))
+		goto fail;
+
+	page = bio_page(bio);
+	if (!page)
+		goto fail;
+
+	folio = page_folio(page);
+	mapping = folio_mapping(folio);
+	if (!mapping || !mapping->host)
+		goto fail;
+	inode = mapping->host;
+
+	if (!inode) 
+		goto fail;
+
+	return inode->i_ino;
+
+fail:
+	return -1;
+}
