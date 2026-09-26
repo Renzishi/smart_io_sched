@@ -16,7 +16,7 @@ bool is_hp_ioprio(u16 ioprio)
 
 bool is_vip_ioprio(u16 ioprio)
 {
-	return IOPRIO_PRIO_HINT(ioprio) & SMART_IO_VIP_IOPRIO_HINT;
+	return (IOPRIO_PRIO_HINT(ioprio) & SMART_IO_VIP_IOPRIO_HINT) || smart_io_rl_vip_action(ioprio);
 }
 
 bool has_smart_ioprio_hint(u16 ioprio)

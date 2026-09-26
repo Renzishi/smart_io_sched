@@ -169,8 +169,12 @@ static u16 smart_io_rl_encode(u16 ioprio, u8 action)
 	u16 new_hint;
 	u8 new_class;
 
-	new_hint = old_hint & ~(SMART_IO_RL_ACTION_MASK |
-				       SMART_IO_HP_IOPRIO_HINT | SMART_IO_VIP_IOPRIO_HINT);
+	if (action == SMART_IO_RL_ACTION_NONE)
+		return ioprio;
+
+	// new_hint = old_hint & ~(SMART_IO_RL_ACTION_MASK |
+	// 			       SMART_IO_HP_IOPRIO_HINT | SMART_IO_VIP_IOPRIO_HINT);
+	new_hint = old_hint & ~(SMART_IO_RL_ACTION_MASK);
 	new_class = ioprio_class;
 	if (new_class == IOPRIO_CLASS_NONE) {
 		new_class = IOPRIO_CLASS_BE;
@@ -179,13 +183,13 @@ static u16 smart_io_rl_encode(u16 ioprio, u8 action)
 
 	if (action == SMART_IO_RL_ACTION_RT) {
 		new_class = IOPRIO_CLASS_RT;
-		new_hint &= ~(SMART_IO_HP_IOPRIO_HINT | SMART_IO_VIP_IOPRIO_HINT);
+		// new_hint &= ~(SMART_IO_HP_IOPRIO_HINT | SMART_IO_VIP_IOPRIO_HINT);
 		new_hint |= (u16)SMART_IO_RL_ACTION_RT << SMART_IO_RL_ACTION_SHIFT;
 	} else if (action == SMART_IO_RL_ACTION_VIP) {
-		new_hint |= SMART_IO_HP_IOPRIO_HINT | SMART_IO_VIP_IOPRIO_HINT;
+		// new_hint |= SMART_IO_HP_IOPRIO_HINT | SMART_IO_VIP_IOPRIO_HINT;
 		new_hint |= (u16)SMART_IO_RL_ACTION_VIP << SMART_IO_RL_ACTION_SHIFT;
 	} else { /* SMART_IO_RL_ACTION_HP */
-		new_hint |= SMART_IO_HP_IOPRIO_HINT;
+		// new_hint |= SMART_IO_HP_IOPRIO_HINT;
 		new_hint |= (u16)SMART_IO_RL_ACTION_HP << SMART_IO_RL_ACTION_SHIFT;
 	}
 
@@ -239,7 +243,7 @@ int smart_io_rl_decode_action(u16 ioprio)
 	return -EINVAL;
 }
 
-static u8 smart_io_rl_random_action(void)
+static u8 smart_io_rl_random_action(u16 hint)
 {
 	u32 vip_pct = (u32)atomic_read(&rl_random_vip_pct);
 	u32 hp_pct = (u32)atomic_read(&rl_random_hp_pct);
@@ -247,10 +251,18 @@ static u8 smart_io_rl_random_action(void)
 	u32 total, roll;
 
 	total = vip_pct + hp_pct + rt_pct;
-	if (!total)
-		return SMART_IO_RL_ACTION_HP;
+	if (total == 0)
+		return SMART_IO_RL_ACTION_NONE;
 
-	roll = smart_io_rl_lcg_next() % total;
+	roll = smart_io_rl_lcg_next() % 100;
+
+	// default as binary action KEEP and PROMOTE ( VIP )
+	if (total != 100 && vip_pct > 0) {
+		if (roll < vip_pct && !(hint & SMART_IO_VIP_IOPRIO_HINT))
+			return SMART_IO_RL_ACTION_VIP;
+		return SMART_IO_RL_ACTION_NONE;
+	}
+
 	if (roll < vip_pct)
 		return SMART_IO_RL_ACTION_VIP;
 	if (roll < vip_pct + hp_pct)
@@ -299,7 +311,7 @@ bool smart_io_rl_classify_request(struct request *rq)
 	else if (mode == SMART_IO_RL_MODE_FIXED)
 		action = (u8)atomic_read(&rl_fixed_action);
 	else if (mode == SMART_IO_RL_MODE_RANDOM)
-		action = smart_io_rl_random_action();
+		action = smart_io_rl_random_action(hint);
 	else {
 		int ret = smart_io_rl_model_action(&state, &action);
 
@@ -384,8 +396,7 @@ u32 smart_io_rl_get_fixed_action(void)
 
 int smart_io_rl_set_random_probs(u32 vip_pct, u32 hp_pct, u32 rt_pct)
 {
-	if (vip_pct > 100U || hp_pct > 100U || rt_pct > 100U ||
-		vip_pct + hp_pct + rt_pct != 100U)
+	if (vip_pct > 100U || hp_pct > 100U || rt_pct > 100U)
 		return -EINVAL;
 	atomic_set(&rl_random_vip_pct, vip_pct);
 	atomic_set(&rl_random_hp_pct, hp_pct);
@@ -401,4 +412,13 @@ int smart_io_rl_set_random_seed(u32 seed)
 	for_each_possible_cpu(cpu)
 		per_cpu(rl_rng_state, cpu) = seed ^ (0x9e3779b9U * (cpu + 1));
 	return 0;
+}
+
+bool smart_io_rl_vip_action(u16 ioprio)
+{
+	u16 hint = IOPRIO_PRIO_HINT(ioprio);
+	if (!(hint & SMART_IO_RL_ACTION_MASK))
+		return false;
+
+	return SMART_IO_RL_ACTION_VIP == smart_io_rl_decode_action(ioprio);
 }

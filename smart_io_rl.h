@@ -158,5 +158,6 @@ int  smart_io_rl_set_fixed_action(u32 action);
 u32  smart_io_rl_get_fixed_action(void);
 int  smart_io_rl_set_random_probs(u32 vip_pct, u32 hp_pct, u32 rt_pct);
 int  smart_io_rl_set_random_seed(u32 seed);
+bool smart_io_rl_vip_action(u16 ioprio);
 
 #endif
