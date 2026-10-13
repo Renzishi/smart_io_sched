@@ -67,7 +67,7 @@ static bool is_special_read(u16 ioprio, blk_opf_t opf,
 static bool current_can_mark_hp(u16 ioprio,
 						  blk_opf_t opf, unsigned int op)
 {
-	return smart_io_rl_cpu_cgroup_class() == SMART_IO_RL_CGROUP_TOP_APP ||
+	return current_uid_is_fg() ||
 		is_special_read(ioprio, opf, op);
 }
 
@@ -89,7 +89,7 @@ static bool current_can_mark_vip(u16 ioprio,
 
 void mark_bio_rt(struct bio *bio)
 {
-	if (!current_uid_is_fg())
+	if (smart_io_rl_cpu_cgroup_class() != SMART_IO_RL_CGROUP_TOP_APP)
 		return;
 
 	bio->bi_ioprio = IOPRIO_PRIO_VALUE_HINT(IOPRIO_CLASS_RT, 0, IOPRIO_PRIO_HINT(bio->bi_ioprio));
