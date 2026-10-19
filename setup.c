@@ -5,6 +5,7 @@
 #include "smart_deadline.h"
 #include "smart_io_dirtyrate.h"
 #include "smart_io_log.h"
+#include "smart_io_rl_policy.h"
 #include "system_context.h"
 #include "trace_instance.h"
 #include "ufs_priority.h"
@@ -91,6 +92,7 @@ static void __exit __maybe_unused smart_io_exit(void)
 	smart_io_ctx_exit();
 	smart_io_tp_exit();
 	smart_io_trace_instance_exit();
+	smart_io_rl_policy_free();
 	smart_io_proc_exit();
 	smart_io_semantics_exit();
 	smart_io_log_info("module unloaded.\n");

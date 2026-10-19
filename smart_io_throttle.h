@@ -166,6 +166,25 @@ struct smart_io_throttle_ctx {
 	u32 issued_depth; /* issue to requeue/final complete */
 	u32 pending_fg;
 	u32 pending_bg;
+	/*
+	 * Layer pressure snapshot for State v2 (RL 晋升四目标方案 §B3): per
+	 * queue-class waiting/inflight counts, split VIP vs non-VIP for the HP
+	 * queue, plus VIP wait bytes. Updated under ctx->lock at insert/issue/
+	 * complete/requeue. Snapshot semantics only (not cross-subsystem
+	 * atomic).
+	 */
+	u32 hp_vip_wait;
+	u32 hp_vip_inflight;
+	u32 hp_nonvip_wait;
+	u32 hp_nonvip_inflight;
+	u32 rt_wait;
+	u32 be_wait;
+	u32 native_vip_wait;
+	u32 rl_vip_wait;
+	u32 native_vip_inflight;
+	u32 rl_vip_inflight;
+	u32 native_vip_wait_bytes;
+	u32 rl_vip_wait_bytes;
 	struct smart_io_completion_sample dev_lat[SMART_IO_DEV_LAT_WINDOW];
 	struct smart_io_completion_sample rl_dev_lat[SMART_IO_RL_DEV_LAT_WINDOW];
 	u8 dev_lat_head;
@@ -361,5 +380,10 @@ bool smart_io_throttle_get_rl_device_snapshot(
 		const struct request *rq,
 		struct smart_io_rl_device_snapshot *snapshot);
 int smart_io_throttle_get_rl_sector_class(const struct request *rq);
+/* Layer pressure snapshot for State v2 (doc §B3); reads ctx counters under
+ * lock. Returns false when the request has no throttle context. */
+bool smart_io_throttle_get_rl_pressure_snapshot(
+		const struct request *rq,
+		struct smart_io_rl_state *state);
 
 #endif

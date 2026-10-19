@@ -2,6 +2,7 @@
 #include <linux/seq_file.h>
 #include <linux/string.h>
 #include <linux/uaccess.h>
+#include <linux/vmalloc.h>
 
 #include "filter.h"
 #include "io_semantics.h"
@@ -10,6 +11,7 @@
 #include "smart_io_log.h"
 #include "smart_io_policy.h"
 #include "smart_io_rl.h"
+#include "smart_io_rl_policy.h"
 #include "smart_io_throttle.h"
 #include "smart_io_types.h"
 #include "system_context.h"
@@ -1035,77 +1037,58 @@ static ssize_t rl_mode_write(struct file *f, const char __user *ub, size_t c,
 	return c;
 }
 
-static int rl_fixed_action_show(struct seq_file *m, void *v)
+static int rl_elevate_pct_show(struct seq_file *m, void *v)
 {
-	static const char *names[4] = { "none", "vip", "hp", "rt" };
-	u32 action = smart_io_rl_get_fixed_action();
-
-	/* setter guarantees action is in {1,2,3}. */
-	seq_printf(m, "%s\n", action <= 3U ? names[action] : "unknown");
+	seq_printf(m, "%u\n", smart_io_rl_get_elevate_pct());
 	return 0;
 }
 
-static int rl_fixed_action_open(struct inode *i, struct file *f)
+static int rl_elevate_pct_open(struct inode *i, struct file *f)
 {
-	return single_open(f, rl_fixed_action_show, NULL);
+	return single_open(f, rl_elevate_pct_show, NULL);
 }
 
-static ssize_t rl_fixed_action_write(struct file *f, const char __user *ub,
+static ssize_t rl_elevate_pct_write(struct file *f, const char __user *ub,
 				     size_t c, loff_t *p)
 {
-	char buf[8];
-	u32 action;
+	u32 pct;
+	int ret;
 
-	if (c > sizeof(buf) - 1)
-		return -EINVAL;
-	if (copy_from_user(buf, ub, c))
-		return -EFAULT;
-	buf[c] = 0;
-
-	if (!strcmp(strstrip(buf), "vip"))
-		action = SMART_IO_RL_ACTION_VIP;
-	else if (!strcmp(strstrip(buf), "hp"))
-		action = SMART_IO_RL_ACTION_HP;
-	else if (!strcmp(strstrip(buf), "rt"))
-		action = SMART_IO_RL_ACTION_RT;
-	else
-		return -EINVAL;
-
-	if (smart_io_rl_set_fixed_action(action))
+	ret = proc_parse_u32(ub, c, &pct);
+	if (ret)
+		return ret;
+	if (smart_io_rl_set_elevate_pct(pct))
 		return -EINVAL;
 	return c;
 }
 
-static int rl_random_probs_show(struct seq_file *m, void *v)
+static int rl_trace_show(struct seq_file *m, void *v)
 {
-	struct smart_io_rl_stats st;
-
-	smart_io_rl_get_stats(&st);
-	seq_printf(m, "%u %u %u\n", st.rl_random_vip_pct,
-		   st.rl_random_hp_pct, st.rl_random_rt_pct);
+	seq_printf(m, "%u\n", smart_io_rl_trace_enabled() ? 1U : 0U);
 	return 0;
 }
 
-static int rl_random_probs_open(struct inode *i, struct file *f)
+static int rl_trace_open(struct inode *i, struct file *f)
 {
-	return single_open(f, rl_random_probs_show, NULL);
+	return single_open(f, rl_trace_show, NULL);
 }
 
-static ssize_t rl_random_probs_write(struct file *f, const char __user *ub,
-				     size_t c, loff_t *p)
+static ssize_t rl_trace_write(struct file *f, const char __user *ub, size_t c,
+			      loff_t *p)
 {
-	char buf[32];
-	u32 vip_pct, hp_pct, rt_pct;
+	int val;
+	char buf[8];
 
 	if (c > sizeof(buf) - 1)
 		return -EINVAL;
 	if (copy_from_user(buf, ub, c))
 		return -EFAULT;
 	buf[c] = 0;
-
-	if (sscanf(strstrip(buf), "%u %u %u", &vip_pct, &hp_pct, &rt_pct) != 3)
+	if (kstrtoint(strstrip(buf), 10, &val))
 		return -EINVAL;
-	if (smart_io_rl_set_random_probs(vip_pct, hp_pct, rt_pct))
+	if (val < 0)
+		return -EINVAL;
+	if (smart_io_rl_set_trace(val != 0))
 		return -EINVAL;
 	return c;
 }
@@ -1138,36 +1121,165 @@ static ssize_t rl_seed_write(struct file *f, const char __user *ub, size_t c,
 	return c;
 }
 
+static int rl_s_gate_show(struct seq_file *m, void *v)
+{
+	seq_printf(m, "%u\n", smart_io_rl_get_s_gate() ? 1U : 0U);
+	return 0;
+}
+
+static int rl_s_gate_open(struct inode *i, struct file *f)
+{
+	return single_open(f, rl_s_gate_show, NULL);
+}
+
+static ssize_t rl_s_gate_write(struct file *f, const char __user *ub, size_t c,
+			       loff_t *p)
+{
+	int val;
+	char buf[8];
+
+	if (c > sizeof(buf) - 1)
+		return -EINVAL;
+	if (copy_from_user(buf, ub, c))
+		return -EFAULT;
+	buf[c] = 0;
+	if (kstrtoint(strstrip(buf), 10, &val))
+		return -EINVAL;
+	if (val < 0)
+		return -EINVAL;
+	return smart_io_rl_set_s_gate(val != 0) ? -EINVAL : c;
+}
+
 static int rl_stats_show(struct seq_file *m, void *v)
 {
 	struct smart_io_rl_stats st;
 
 	smart_io_rl_get_stats(&st);
 	seq_printf(m, "mode=%u\n", st.rl_mode);
-	seq_printf(m, "fixed_action=%u\n", st.rl_fixed_action);
-	seq_printf(m, "random_probs=%u %u %u\n", st.rl_random_vip_pct,
-		   st.rl_random_hp_pct, st.rl_random_rt_pct);
+	seq_printf(m, "elevate_pct=%u\n", st.rl_elevate_pct);
 	seq_printf(m, "random_seed=%u\n", st.rl_random_seed);
+	seq_printf(m, "s_gate=%u\n", st.rl_s_gate);
+	seq_printf(m, "main_in_s_count=%llu\n",
+		   (unsigned long long)st.rl_main_in_s_count);
 	seq_printf(m, "rl_decision_count=%llu\n",
 		   (unsigned long long)st.rl_decision_count);
+	seq_printf(m, "rl_keep_count=%llu\n",
+		   (unsigned long long)st.rl_keep_count);
+	seq_printf(m, "rl_elevate_count=%llu\n",
+		   (unsigned long long)st.rl_elevate_count);
+	seq_printf(m, "rl_eligible_count=%llu\n",
+		   (unsigned long long)st.rl_eligible_count);
 	seq_printf(m, "rl_protected_count=%llu\n",
 		   (unsigned long long)st.rl_protected_count);
+	seq_printf(m, "rl_native_vip_count=%llu\n",
+		   (unsigned long long)st.rl_native_vip_count);
 	seq_printf(m, "rl_fallback_count=%llu\n",
 		   (unsigned long long)st.rl_fallback_count);
 	seq_printf(m, "rl_decode_error_count=%llu\n",
 		   (unsigned long long)st.rl_decode_error_count);
-	seq_printf(m, "rl_action_vip=%llu\n",
-		   (unsigned long long)st.rl_action_vip);
-	seq_printf(m, "rl_action_hp=%llu\n",
-		   (unsigned long long)st.rl_action_hp);
-	seq_printf(m, "rl_action_rt=%llu\n",
-		   (unsigned long long)st.rl_action_rt);
 	return 0;
 }
 
 static int rl_stats_open(struct inode *i, struct file *f)
 {
 	return single_open(f, rl_stats_show, NULL);
+}
+
+/*
+ * Learned-policy decision-table nodes (doc §Phase 3). MODEL mode reads the
+ * offline-quantized table loaded here; with no table loaded it falls back to
+ * KEEP. The table is streamed in via a procfs write (GKI: no filp_open in the
+ * module): `cat /data/.../policy.bin > /proc/smart_io_sched/rl_policy_bin`.
+ * The first 35 bytes are the header; the rest fill the table buffer.
+ */
+static ssize_t rl_policy_bin_write(struct file *f, const char __user *ub,
+				   size_t c, loff_t *ppos)
+{
+	u8 *kbuf;
+	int ret;
+
+	/* A new feed starts a fresh table; reset any staged/loaded state.
+	 * (cat opens once, so the first write is the header.) */
+	if (*ppos == 0)
+		smart_io_rl_policy_reset();
+
+	if (c > (size_t)SMART_IO_POLICY_MAX_SIZE)
+		return -EINVAL;
+	kbuf = vmalloc(c);
+	if (!kbuf)
+		return -ENOMEM;
+	if (copy_from_user(kbuf, ub, c)) {
+		vfree(kbuf);
+		return -EFAULT;
+	}
+	ret = smart_io_rl_policy_feed(kbuf, (u32)c);
+	vfree(kbuf);
+	if (ret)
+		return ret;
+	*ppos += c;
+	return c;
+}
+
+static int rl_policy_bin_open(struct inode *i, struct file *f)
+{
+	/* Write-only binary stream; no seq_file, nothing to show. */
+	return 0;
+}
+
+static int rl_policy_on_show(struct seq_file *m, void *v)
+{
+	bool on = false;
+
+	smart_io_rl_policy_status(NULL, NULL, NULL, NULL, NULL, &on, NULL, NULL);
+	seq_printf(m, "%u\n", on ? 1U : 0U);
+	return 0;
+}
+
+static int rl_policy_on_open(struct inode *i, struct file *f)
+{
+	return single_open(f, rl_policy_on_show, NULL);
+}
+
+static ssize_t rl_policy_on_write(struct file *f, const char __user *ub,
+				  size_t c, loff_t *p)
+{
+	int val;
+	char buf[8];
+
+	if (c > sizeof(buf) - 1)
+		return -EINVAL;
+	if (copy_from_user(buf, ub, c))
+		return -EFAULT;
+	buf[c] = 0;
+	if (kstrtoint(strstrip(buf), 10, &val))
+		return -EINVAL;
+	smart_io_rl_policy_set_enabled(val != 0);
+	return c;
+}
+
+static int rl_policy_status_show(struct seq_file *m, void *v)
+{
+	u8 ver, ndims;
+	u32 tsize, app_uid;
+	bool loaded, enabled;
+	u64 hits, misses;
+
+	smart_io_rl_policy_status(&ver, &ndims, &tsize, &app_uid, &loaded,
+				  &enabled, &hits, &misses);
+	seq_printf(m, "version=%u\n", ver);
+	seq_printf(m, "n_dims=%u\n", ndims);
+	seq_printf(m, "table_size=%u\n", tsize);
+	seq_printf(m, "app_uid=%u\n", app_uid);
+	seq_printf(m, "loaded=%u\n", loaded ? 1U : 0U);
+	seq_printf(m, "enabled=%u\n", enabled ? 1U : 0U);
+	seq_printf(m, "hits=%llu\n", (unsigned long long)hits);
+	seq_printf(m, "misses=%llu\n", (unsigned long long)misses);
+	return 0;
+}
+
+static int rl_policy_status_open(struct inode *i, struct file *f)
+{
+	return single_open(f, rl_policy_status_show, NULL);
 }
 
 struct proc_node {
@@ -1437,11 +1549,11 @@ struct proc_node proc_nodes[] = {
 		.exist = false,
 	},
 	{
-		.name = "rl_fixed_action",
+		.name = "rl_elevate_pct",
 		.ops = &(struct proc_ops){
-			.proc_open = rl_fixed_action_open,
+			.proc_open = rl_elevate_pct_open,
 			.proc_read = seq_read,
-			.proc_write = rl_fixed_action_write,
+			.proc_write = rl_elevate_pct_write,
 			.proc_lseek = seq_lseek,
 			.proc_release = single_release,
 		},
@@ -1449,11 +1561,11 @@ struct proc_node proc_nodes[] = {
 		.exist = false,
 	},
 	{
-		.name = "rl_random_probs",
+		.name = "rl_trace",
 		.ops = &(struct proc_ops){
-			.proc_open = rl_random_probs_open,
+			.proc_open = rl_trace_open,
 			.proc_read = seq_read,
-			.proc_write = rl_random_probs_write,
+			.proc_write = rl_trace_write,
 			.proc_lseek = seq_lseek,
 			.proc_release = single_release,
 		},
@@ -1473,9 +1585,54 @@ struct proc_node proc_nodes[] = {
 		.exist = false,
 	},
 	{
+		.name = "rl_s_gate",
+		.ops = &(struct proc_ops){
+			.proc_open = rl_s_gate_open,
+			.proc_read = seq_read,
+			.proc_write = rl_s_gate_write,
+			.proc_lseek = seq_lseek,
+			.proc_release = single_release,
+		},
+		.mode = 0644,
+		.exist = false,
+	},
+	{
 		.name = "rl_stats",
 		.ops = &(struct proc_ops){
 			.proc_open = rl_stats_open,
+			.proc_read = seq_read,
+			.proc_lseek = seq_lseek,
+			.proc_release = single_release,
+		},
+		.mode = 0444,
+		.exist = false,
+	},
+	{
+		.name = "rl_policy_bin",
+		.ops = &(struct proc_ops){
+			.proc_open = rl_policy_bin_open,
+			.proc_write = rl_policy_bin_write,
+			.proc_lseek = seq_lseek,
+		},
+		.mode = 0200,
+		.exist = false,
+	},
+	{
+		.name = "rl_policy_on",
+		.ops = &(struct proc_ops){
+			.proc_open = rl_policy_on_open,
+			.proc_read = seq_read,
+			.proc_write = rl_policy_on_write,
+			.proc_lseek = seq_lseek,
+			.proc_release = single_release,
+		},
+		.mode = 0644,
+		.exist = false,
+	},
+	{
+		.name = "rl_policy_status",
+		.ops = &(struct proc_ops){
+			.proc_open = rl_policy_status_open,
 			.proc_read = seq_read,
 			.proc_lseek = seq_lseek,
 			.proc_release = single_release,

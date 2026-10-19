@@ -210,18 +210,25 @@ smart_io_throttle_select_queue(const struct request *rq)
 			SMART_IO_QUEUE_RT : SMART_IO_QUEUE_BE;
 
 	/*
-	 * RL-controlled READ: the RL action bits (7-8) are authoritative.
-	 * Check before the hint-bit rules so a foreground sync read that
-	 * RL demoted to RT is not bumped back to HP.
+	 * RL-controlled READ (binary KEEP/ELEVATE, doc §B1): the RL action
+	 * bits (7-8) are authoritative. KEEP keeps the baseline hint-driven
+	 * route (HP/RT/BE); ELEVATE promotes into the HP queue VIP segment.
+	 * Check before the hint-bit rules so the recorded decision wins.
 	 */
 	if (IOPRIO_PRIO_HINT(ioprio) & SMART_IO_RL_ACTION_MASK) {
 		int rl_action = smart_io_rl_decode_action(ioprio);
 
-		if (rl_action == SMART_IO_RL_ACTION_RT)
-			return SMART_IO_QUEUE_RT;
-		if (rl_action == SMART_IO_RL_ACTION_VIP ||
-		    rl_action == SMART_IO_RL_ACTION_HP)
+		if (rl_action == SMART_IO_RL_ACTION_ELEVATE)
 			return SMART_IO_QUEUE_HP;
+		if (rl_action == SMART_IO_RL_ACTION_KEEP) {
+			if (is_hp_ioprio(ioprio) || is_vip_ioprio(ioprio))
+				return SMART_IO_QUEUE_HP;
+			return smart_io_throttle_queue_from_ioprio(ioprio);
+		}
+		if (rl_action < 0) {
+			smart_io_rl_note_decode_error();
+			return SMART_IO_QUEUE_HP;
+		}
 	}
 	/*
 	 * Hint-bit driven queue selection. All hint bits (HP, PGF, PI, VIP,
@@ -305,10 +312,28 @@ static u32 *smart_io_throttle_pending_counter(struct smart_io_throttle_ctx *ctx,
 	}
 }
 
+/* Forward declarations of the State v2 layer-pressure helpers (defined below
+ * the pending accounting, but used by pending_inc/dec and the inflight hooks). */
+static void smart_io_throttle_pressure_wait_inc_locked(
+		struct smart_io_throttle_ctx *ctx,
+		struct smart_io_rq_meta *meta, u16 ioprio, u32 bytes);
+static void smart_io_throttle_pressure_wait_dec_locked(
+		struct smart_io_throttle_ctx *ctx,
+		struct smart_io_rq_meta *meta, u16 ioprio, u32 bytes);
+static void smart_io_throttle_pressure_inflight_inc_locked(
+		struct smart_io_throttle_ctx *ctx,
+		struct smart_io_rq_meta *meta, u16 ioprio);
+static void smart_io_throttle_pressure_inflight_dec_locked(
+		struct smart_io_throttle_ctx *ctx,
+		struct smart_io_rq_meta *meta, u16 ioprio);
+
 static void smart_io_throttle_pending_inc_locked(struct smart_io_throttle_ctx *ctx,
 							  struct smart_io_rq_meta *meta)
 {
 	u32 *pending;
+	struct request *rq;
+	u16 ioprio;
+	u32 bytes;
 
 	if (meta->queued)
 		return;
@@ -322,12 +347,24 @@ static void smart_io_throttle_pending_inc_locked(struct smart_io_throttle_ctx *c
 	if (meta->class == SMART_IO_RQ_BACKGROUND &&
 	    smart_io_throttle_enabled())
 		meta->queued_ts_ns = ktime_get_boottime_ns();
+
+	/* Layer-pressure wait counter (doc §B3). */
+	rq = meta->rq;
+	if (rq) {
+		ioprio = req_get_ioprio(rq);
+		bytes = min_t(u64, blk_rq_bytes(rq), U32_MAX);
+		smart_io_throttle_pressure_wait_inc_locked(ctx, meta, ioprio,
+							   bytes);
+	}
 }
 
 static void smart_io_throttle_pending_dec_locked(struct smart_io_throttle_ctx *ctx,
 							  struct smart_io_rq_meta *meta)
 {
 	u32 *pending;
+	struct request *rq;
+	u16 ioprio;
+	u32 bytes;
 
 	if (!meta || !meta->queued)
 		return;
@@ -338,6 +375,15 @@ static void smart_io_throttle_pending_dec_locked(struct smart_io_throttle_ctx *c
 		(*pending)--;
 	meta->queued = false;
 	meta->queued_ts_ns = 0;
+
+	/* Layer-pressure wait counter (doc §B3). */
+	rq = meta->rq;
+	if (rq) {
+		ioprio = req_get_ioprio(rq);
+		bytes = min_t(u64, blk_rq_bytes(rq), U32_MAX);
+		smart_io_throttle_pressure_wait_dec_locked(ctx, meta, ioprio,
+							   bytes);
+	}
 }
 
 static u64 smart_io_throttle_inflight_key(enum req_op op, sector_t end_sector)
@@ -345,13 +391,140 @@ static u64 smart_io_throttle_inflight_key(enum req_op op, sector_t end_sector)
 	return ((u64)end_sector << 8) | (u8)op;
 }
 
-static void smart_io_throttle_inflight_remove_locked(struct smart_io_rq_meta *meta)
+/*
+ * Layer-pressure accounting for State v2 (doc §B3). Classifies a request into
+ * a queue-class + VIP segment and bumps the corresponding wait/inflight
+ * counter. VIP = HP queue with the VIP route bit set (native or RL ELEVATE);
+ * hp_nonvip = HP queue without VIP. RT/BE are tracked as queue waits only.
+ * Called under ctx->lock with the request's current ioprio.
+ */
+static bool smart_io_throttle_rl_pressure_classify(
+		struct smart_io_rq_meta *meta, u16 ioprio, bool *is_vip,
+		bool *is_rl_vip)
+{
+	u16 hint = IOPRIO_PRIO_HINT(ioprio);
+
+	*is_vip = false;
+	*is_rl_vip = false;
+	if (meta->queue_class != SMART_IO_QUEUE_HP)
+		return false;
+	*is_vip = !!(hint & SMART_IO_VIP_IOPRIO_HINT);
+	if (*is_vip)
+		*is_rl_vip = !!(hint & SMART_IO_RL_ACTION_MASK);
+	return true;
+}
+
+static void smart_io_throttle_pressure_wait_inc_locked(
+		struct smart_io_throttle_ctx *ctx,
+		struct smart_io_rq_meta *meta, u16 ioprio, u32 bytes)
+{
+	bool vip, rl_vip;
+
+	smart_io_throttle_rl_pressure_classify(meta, ioprio, &vip, &rl_vip);
+	if (meta->queue_class == SMART_IO_QUEUE_HP) {
+		if (vip) {
+			ctx->hp_vip_wait++;
+			if (rl_vip) {
+				ctx->rl_vip_wait++;
+				ctx->rl_vip_wait_bytes += bytes;
+			} else {
+				ctx->native_vip_wait++;
+				ctx->native_vip_wait_bytes += bytes;
+			}
+		} else
+			ctx->hp_nonvip_wait++;
+	} else if (meta->queue_class == SMART_IO_QUEUE_RT)
+		ctx->rt_wait++;
+	else
+		ctx->be_wait++;
+}
+
+static void smart_io_throttle_pressure_wait_dec_locked(
+		struct smart_io_throttle_ctx *ctx,
+		struct smart_io_rq_meta *meta, u16 ioprio, u32 bytes)
+{
+	bool vip, rl_vip;
+
+	smart_io_throttle_rl_pressure_classify(meta, ioprio, &vip, &rl_vip);
+	if (meta->queue_class == SMART_IO_QUEUE_HP) {
+		if (vip) {
+			if (ctx->hp_vip_wait)
+				ctx->hp_vip_wait--;
+			if (rl_vip) {
+				if (ctx->rl_vip_wait)
+					ctx->rl_vip_wait--;
+				if (ctx->rl_vip_wait_bytes >= bytes)
+					ctx->rl_vip_wait_bytes -= bytes;
+			} else {
+				if (ctx->native_vip_wait)
+					ctx->native_vip_wait--;
+				if (ctx->native_vip_wait_bytes >= bytes)
+					ctx->native_vip_wait_bytes -= bytes;
+			}
+		} else if (ctx->hp_nonvip_wait)
+			ctx->hp_nonvip_wait--;
+	} else if (meta->queue_class == SMART_IO_QUEUE_RT) {
+		if (ctx->rt_wait)
+			ctx->rt_wait--;
+	} else if (ctx->be_wait)
+		ctx->be_wait--;
+}
+
+static void smart_io_throttle_pressure_inflight_inc_locked(
+		struct smart_io_throttle_ctx *ctx,
+		struct smart_io_rq_meta *meta, u16 ioprio)
+{
+	bool vip, rl_vip;
+
+	if (meta->queue_class != SMART_IO_QUEUE_HP)
+		return;
+	smart_io_throttle_rl_pressure_classify(meta, ioprio, &vip, &rl_vip);
+	if (!vip) {
+		ctx->hp_nonvip_inflight++;
+		return;
+	}
+	ctx->hp_vip_inflight++;
+	if (rl_vip)
+		ctx->rl_vip_inflight++;
+	else
+		ctx->native_vip_inflight++;
+}
+
+static void smart_io_throttle_pressure_inflight_dec_locked(
+		struct smart_io_throttle_ctx *ctx,
+		struct smart_io_rq_meta *meta, u16 ioprio)
+{
+	bool vip, rl_vip;
+
+	if (meta->queue_class != SMART_IO_QUEUE_HP)
+		return;
+	smart_io_throttle_rl_pressure_classify(meta, ioprio, &vip, &rl_vip);
+	if (!vip) {
+		if (ctx->hp_nonvip_inflight)
+			ctx->hp_nonvip_inflight--;
+		return;
+	}
+	if (ctx->hp_vip_inflight)
+		ctx->hp_vip_inflight--;
+	if (rl_vip) {
+		if (ctx->rl_vip_inflight)
+			ctx->rl_vip_inflight--;
+	} else if (ctx->native_vip_inflight)
+		ctx->native_vip_inflight--;
+}
+
+static void smart_io_throttle_inflight_remove_locked(
+		struct smart_io_throttle_ctx *ctx,
+		struct smart_io_rq_meta *meta)
 {
 	if (!meta || !meta->inflight_indexed)
 		return;
 	hash_del(&meta->inflight_node);
 	hash_del(&meta->inflight_start_node);
 	meta->inflight_indexed = false;
+	/* Layer-pressure inflight counter (doc §B3). */
+	smart_io_throttle_pressure_inflight_dec_locked(ctx, meta,
+						       req_get_ioprio(meta->rq));
 }
 
 static void smart_io_throttle_inflight_add_locked(
@@ -369,6 +542,9 @@ static void smart_io_throttle_inflight_add_locked(
 	hash_add(ctx->inflight_start, &meta->inflight_start_node,
 		 smart_io_throttle_inflight_key(meta->op, meta->start_sector));
 	meta->inflight_indexed = true;
+	/* Layer-pressure inflight counter (doc §B3). */
+	smart_io_throttle_pressure_inflight_inc_locked(ctx, meta,
+						       req_get_ioprio(rq));
 }
 
 static void smart_io_throttle_clear_feedback_binding_locked(
@@ -569,9 +745,10 @@ static void smart_io_throttle_trace_dispatch(struct smart_io_throttle_ctx *ctx,
 		return;
 
 	// smart_io_raw_emit("io_throttle_dispatch: ts_ns=%llu queue=%p session_id=%llu control_id=%llu decision_id=%llu rq_id=%llu rq_p=%p class=%u op=%u selection=%s level=%s policy=%s current_depth_before=%u current_depth_after=%u bg_current_depth_before=%u bg_current_depth_after=%u reserved_depth_before=%u reserved_depth_after=%u issued_depth_before=%u issued_depth_after=%u target_depth=%u feedback_bound=%u feedback_sample_no=%u queued_wait_us=%llu background_deadline_ms=%u\n",
-	smart_io_raw_emit("io_throttle_dispatch: ts_ns=%llu control_id=%llu decision_id=%llu rq_p=%p class=%u selection=%s level=%s policy=%s depth_before=%u depth_after=%u bg_before=%u bg_after=%u issued_before=%u issued_after=%u target_depth=%u\n",
+	smart_io_raw_emit("io_throttle_dispatch: ts_ns=%llu control_id=%llu decision_id=%llu rq_id=%llu rq_p=%p class=%u selection=%s level=%s policy=%s depth_before=%u depth_after=%u bg_before=%u bg_after=%u issued_before=%u issued_after=%u target_depth=%u\n",
 			  ktime_get_boottime_ns(),
 			  ctx->control_id, meta ? meta->dispatch_decision_id : 0,
+			  meta ? meta->rq_id : 0,
 			  meta ? (void *)meta->rq : NULL,
 			  meta ? meta->class : SMART_IO_RQ_BACKGROUND,
 			  selection_names[selection],
@@ -594,9 +771,10 @@ static void smart_io_throttle_trace_feedback(struct smart_io_throttle_ctx *ctx,
 	if (unlikely(atomic_read(&rawdata_trace_enabled) == 0))
 		return;
 
-	smart_io_raw_emit("io_throttle_feedback: control_id=%llu decision_id=%llu rq_p=%p class=%u issue_ts_ns=%llu completion_ts_ns=%llu dev_lat_us=%u status=%u nr_bytes=%u sample_no=%u total_dev_lat_us=%llu mean_dev_lat_us=%u max_dev_lat_us=%u result=%s level=%s policy=%s target_depth=%u reserved_depth=%u bg_cur_depth=%u issued_depth=%u\n",
+	smart_io_raw_emit("io_throttle_feedback: control_id=%llu decision_id=%llu rq_id=%llu rq_p=%p class=%u issue_ts_ns=%llu completion_ts_ns=%llu dev_lat_us=%u status=%u nr_bytes=%u sample_no=%u total_dev_lat_us=%llu mean_dev_lat_us=%u max_dev_lat_us=%u result=%s level=%s policy=%s target_depth=%u reserved_depth=%u bg_cur_depth=%u issued_depth=%u\n",
 			  ctx->control_id,
 			  meta ? meta->dispatch_decision_id : 0,
+			  meta ? meta->rq_id : 0,
 			  meta ? (void *)meta->rq : NULL,
 			  meta ? meta->class : SMART_IO_RQ_BACKGROUND,
 			  issue_ns, complete_ns, latency_us, (u32)status,
@@ -699,7 +877,7 @@ static void smart_io_throttle_free_meta_locked(struct smart_io_throttle_ctx *ctx
 	}
 
 	smart_io_throttle_pending_dec_locked(ctx, meta);
-	smart_io_throttle_inflight_remove_locked(meta);
+	smart_io_throttle_inflight_remove_locked(ctx, meta);
 	if (ctx->feedback_meta == meta)
 		smart_io_throttle_reset_feedback_locked(ctx);
 	if (rq && (rq->rq_flags & RQF_USE_SCHED) &&
@@ -1776,7 +1954,7 @@ void smart_io_throttle_finish_request(struct smart_io_throttle_ctx *ctx,
 		feedback_meta = *meta;
 		trace_feedback = true;
 	}
-	smart_io_throttle_inflight_remove_locked(meta);
+	smart_io_throttle_inflight_remove_locked(ctx, meta);
 	wake |= smart_io_throttle_release_deadline_locked(ctx, meta);
 	wake |= smart_io_throttle_release_issued_depth_locked(ctx,
 								    &meta->issued_accounted);
@@ -2190,6 +2368,41 @@ bool smart_io_throttle_get_rl_device_snapshot(
 	return true;
 }
 
+bool smart_io_throttle_get_rl_pressure_snapshot(
+		const struct request *rq,
+		struct smart_io_rl_state *state)
+{
+	struct smart_io_throttle_ctx *ctx;
+	unsigned long flags;
+
+	if (!rq || !rq->q || !state)
+		return false;
+
+	rcu_read_lock();
+	ctx = smart_io_throttle_find_ctx_rcu(rq->q);
+	if (!ctx) {
+		rcu_read_unlock();
+		return false;
+	}
+
+	spin_lock_irqsave(&ctx->lock, flags);
+	state->vip_wait = ctx->hp_vip_wait;
+	state->vip_inflight = ctx->hp_vip_inflight;
+	state->hp_nonvip_wait = ctx->hp_nonvip_wait;
+	state->hp_nonvip_inflight = ctx->hp_nonvip_inflight;
+	state->rt_wait = ctx->rt_wait;
+	state->be_wait = ctx->be_wait;
+	state->rl_vip_wait = ctx->rl_vip_wait;
+	state->rl_vip_inflight = ctx->rl_vip_inflight;
+	state->native_vip_wait = ctx->native_vip_wait;
+	state->native_vip_inflight = ctx->native_vip_inflight;
+	state->native_vip_wait_bytes = ctx->native_vip_wait_bytes;
+	state->rl_vip_wait_bytes = ctx->rl_vip_wait_bytes;
+	spin_unlock_irqrestore(&ctx->lock, flags);
+	rcu_read_unlock();
+	return true;
+}
+
 int smart_io_throttle_get_rl_sector_class(const struct request *rq)
 {
 	struct smart_io_throttle_ctx *ctx;
@@ -2360,7 +2573,7 @@ void smart_io_throttle_record_requeue(struct request *rq)
 		feedback_action = ctx->action;
 		trace_feedback = true;
 	}
-	smart_io_throttle_inflight_remove_locked(meta);
+	smart_io_throttle_inflight_remove_locked(ctx, meta);
 	wake |= smart_io_throttle_release_deadline_locked(ctx, meta);
 	wake |= smart_io_throttle_release_issued_depth_locked(ctx,
 								    &meta->issued_accounted);
@@ -2521,7 +2734,7 @@ void smart_io_throttle_record_complete(struct request *rq, blk_status_t status,
 		trace_feedback = feedback_result != NULL;
 	}
 	if (final) {
-		smart_io_throttle_inflight_remove_locked(meta);
+		smart_io_throttle_inflight_remove_locked(ctx, meta);
 		wake |= smart_io_throttle_release_deadline_locked(ctx, meta);
 		wake |= smart_io_throttle_release_issued_depth_locked(ctx,
 								    &meta->issued_accounted);

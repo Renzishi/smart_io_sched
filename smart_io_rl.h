@@ -20,19 +20,25 @@ struct smart_io_rl_device_snapshot {
 };
 
 /*
- * READ request-level RL priority (v1).
+ * READ request-level RL priority (v2, RL 晋升四目标方案 §B1).
  *
- * The RL decision runs in dd_insert_request(), before queue selection, and
- * writes the chosen action into the request ioprio hint field using bits 7-8.
- * Those bits are NOT part of SMART_IO_PRIVATE_HINT_MASK (the route bits used
- * by the 12-action throttle model, bits 3-6); they are only parsed offline
- * from the final ioprio recorded by block_rq_insert. See
- * docs/RL-per-request优先级-排采集前置设计稿.md for the full spec.
+ * Binary action on non-VIP READs:
+ *   KEEP    : do not change the baseline routing; the request keeps its
+ *             original ioprio (class + hint) so it lands in the same
+ *             queue with the same VIP treatment as the prio-test baseline.
+ *   ELEVATE : promote the request to VIP treatment in the HP queue by
+ *             setting the HP + VIP route hint bits (real promotion, not a
+ *             fake physical queue).
  *
- * The route/source hint bits (HP/PGF/PI/VIP/MAIN, bits 3-6 and 9) are NOT
- * defined here; they come from smart_io_types.h (SMART_IO_*_IOPRIO_HINT),
- * the module's single source of truth. This file only adds the RL-action
- * bits (7-8) on top.
+ * The decision is encoded in the request ioprio hint field using bits 7-8
+ * (SMART_IO_RL_ACTION_*). Those bits are NOT part of SMART_IO_PRIVATE_HINT_MASK
+ * (bits 3-6,9); they are parsed offline from the final ioprio recorded by
+ * block_rq_insert and drive queue selection (smart_io_throttle_select_rq_queue)
+ * and VIP treatment (is_vip_request). The encode/decode/selection/treatment
+ * paths must all read these bits consistently.
+ *
+ * The route/source hint bits (HP/PGF/PI/VIP/MAIN, bits 3-6 and 9) come from
+ * smart_io_types.h; this file only adds the RL-action bits (7-8) on top.
  */
 
 #include "smart_io_types.h"
@@ -41,19 +47,16 @@ struct smart_io_rl_device_snapshot {
 #define SMART_IO_RL_ACTION_MASK \
 	(0x3U << SMART_IO_RL_ACTION_SHIFT)
 
-#define SMART_IO_RL_ACTION_NONE  0U
-#define SMART_IO_RL_ACTION_VIP   1U
-#define SMART_IO_RL_ACTION_HP    2U
-#define SMART_IO_RL_ACTION_RT    3U
+#define SMART_IO_RL_ACTION_NONE    0U /* no RL decision recorded */
+#define SMART_IO_RL_ACTION_KEEP    2U /* keep baseline routing (decided) */
+#define SMART_IO_RL_ACTION_ELEVATE 3U /* promote to HP queue VIP segment */
 
-/* Collection modes (doc §9): 0 off, A rule, B fixed, C random, D model. */
-#define SMART_IO_RL_MODE_OFF    0U
-#define SMART_IO_RL_MODE_RULE   1U
-#define SMART_IO_RL_MODE_FIXED  2U
-#define SMART_IO_RL_MODE_RANDOM 3U
-#define SMART_IO_RL_MODE_MODEL  4U
+/* Collection modes: explicit binary mode, no implicit mode selection. */
+#define SMART_IO_RL_MODE_OFF     0U
+#define SMART_IO_RL_MODE_RANDOM  1U /* random KEEP/ELEVATE with prob p */
+#define SMART_IO_RL_MODE_MODEL   2U /* model-decided (fallback until deployed) */
 
-#define SMART_IO_RL_MODE_MAX    4U
+#define SMART_IO_RL_MODE_MAX     2U
 
 enum smart_io_rl_uid_class {
 	SMART_IO_RL_UID_UNKNOWN = 0,
@@ -90,6 +93,29 @@ enum smart_io_rl_sector_class {
 	SMART_IO_RL_SECTOR_NON_CONTIGUOUS,
 };
 
+/*
+ * Submission-time source class relative to the foreground identity
+ * (fg UID / TOP_APP). Encoded at the first decision from the current
+ * thread context; insert context is recorded separately and never
+ * presented as the original submitter.
+ */
+enum smart_io_rl_source_class {
+	SMART_IO_RL_SRC_UNKNOWN = 0,
+	SMART_IO_RL_SRC_FG_TOPAPP,  /* fg UID and TOP_APP */
+	SMART_IO_RL_SRC_FG_ONLY,    /* fg UID only */
+	SMART_IO_RL_SRC_TOPAPP_ONLY,/* TOP_APP only */
+	SMART_IO_RL_SRC_NEITHER,
+};
+
+/* Main-thread run state for State v2 (observed, not a dependency graph). */
+enum smart_io_rl_main_state {
+	SMART_IO_RL_MAIN_UNKNOWN = 0,
+	SMART_IO_RL_MAIN_RUNNING = 1,
+	SMART_IO_RL_MAIN_RUNNABLE = 2, /* woken, not yet scheduled */
+	SMART_IO_RL_MAIN_SLEEPING = 3, /* TASK_INTERRUPTIBLE (S) */
+	SMART_IO_RL_MAIN_BLOCKED = 4,  /* TASK_UNINTERRUPTIBLE (D) */
+};
+
 struct smart_io_rl_state {
 	u32 size_bytes;
 	u8 sector_class;
@@ -108,10 +134,28 @@ struct smart_io_rl_state {
 	u8 is_pgf;
 	u8 is_pi;
 	u8 original_ioprio_class;
+	u8 base_queue;        /* SMART_IO_QUEUE_* before action */
+	u8 base_is_vip;       /* VIP treatment before action */
+	u8 source_class;      /* enum smart_io_rl_source_class */
+	u8 base_hp_hint;      /* HP route bit before action */
+	u8 main_state;        /* enum smart_io_rl_main_state */
+	u32 main_block_age_us;/* current S/D interval age; 0 if none */
+	u32 vip_wait;         /* HP-queue VIP waiting (all) */
+	u32 vip_inflight;
+	u32 hp_nonvip_wait;   /* HP-queue non-VIP waiting */
+	u32 hp_nonvip_inflight;
+	u32 rt_wait;          /* RT queue waiting (all UIDs) */
+	u32 be_wait;          /* BE queue waiting (all UIDs) */
+	u32 rl_vip_wait;      /* VIPs promoted by this policy (waiting) */
+	u32 rl_vip_inflight;
+	u32 native_vip_wait;  /* baseline-native VIPs (waiting) */
+	u32 native_vip_inflight;
+	u32 native_vip_wait_bytes;
+	u32 rl_vip_wait_bytes;
 	struct smart_io_rl_device_snapshot device;
 };
 
-/* Fallback / anomaly reasons (doc §11). */
+/* Fallback / anomaly reasons (doc §B1/§B4). */
 enum smart_io_rl_fallback {
 	SMART_IO_RL_FB_NONE = 0,
 	SMART_IO_RL_FB_STATE_MISSING = 1,
@@ -119,28 +163,40 @@ enum smart_io_rl_fallback {
 	SMART_IO_RL_FB_ENCODE_ERROR = 3,
 };
 
+/* Protection reasons (recorded, not fallbacks). */
+enum smart_io_rl_protection {
+	SMART_IO_RL_PROT_NONE = 0,
+	SMART_IO_RL_PROT_FUA,
+	SMART_IO_RL_PROT_PREFLUSH,
+	SMART_IO_RL_PROT_PGF,
+	SMART_IO_RL_PROT_PI,
+	SMART_IO_RL_PROT_NATIVE_VIP,
+	SMART_IO_RL_PROT_NON_READ,
+};
+
 struct smart_io_rl_stats {
 	u64 rl_decision_count;
+	u64 rl_keep_count;
+	u64 rl_elevate_count;
+	u64 rl_eligible_count;
 	u64 rl_protected_count;
+	u64 rl_native_vip_count;
 	u64 rl_fallback_count;
 	u64 rl_decode_error_count;
-	u64 rl_action_vip;
-	u64 rl_action_hp;
-	u64 rl_action_rt;
 	u32 rl_mode;
-	u32 rl_fixed_action;
-	u32 rl_random_vip_pct;
-	u32 rl_random_hp_pct;
-	u32 rl_random_rt_pct;
+	u32 rl_elevate_pct;
 	u32 rl_random_seed;
+	u32 rl_s_gate;        /* S-gate: only promote while main thread is in S */
+	u64 rl_main_in_s_count; /* decisions made while main thread was in S */
 };
 
 /*
  * Called from dd_insert_request() while holding the scheduler lock, before
- * queue selection. Decides the READ action (VIP/HP/RT), writes the RL hint
- * bits and the final ioprio class, and applies the protection paths and
- * fallback rules. Returns true when the request was RL-controlled.
- * Non-READ and protected requests return false and are left on the fixed path.
+ * queue selection. For READ requests in binary collection mode, decides
+ * KEEP/ELEVATE (random or model), records the decision in the ioprio RL
+ * bits, applies protection paths and fallback rules, updates the main-thread
+ * observation, and emits the gated decision trace. Non-READ and protected
+ * requests keep the fixed path.
  */
 bool smart_io_rl_classify_request(struct request *rq);
 int smart_io_rl_model_action(const struct smart_io_rl_state *state,
@@ -148,16 +204,39 @@ int smart_io_rl_model_action(const struct smart_io_rl_state *state,
 int smart_io_rl_decode_action(u16 ioprio);
 u8 smart_io_rl_cpu_cgroup_class(void);
 
+/* State v2 main-thread observation (doc §B2/§B3). */
+int smart_io_rl_main_state(u64 *block_age_us);
+/* True iff the main thread is in an S (TASK_INTERRUPTIBLE) block interval,
+ * i.e. waiting on binder/futex/sync (not a D-state block). Event-driven via
+ * the sched callbacks (independent of fg_main_pid freshness). Gates S-only
+ * random promotion (S-gate). */
+bool smart_io_rl_main_in_s(void);
+/* Event-driven main-thread block-interval tracking (doc §B2), called from
+ * the sched_switch / sched_wakeup callbacks. Runs regardless of raw printing. */
+void smart_io_rl_track_switch_out(unsigned long prev_state, bool preempt);
+void smart_io_rl_track_switch_in(void);
+void smart_io_rl_track_wakeup(void);
+void smart_io_rl_note_fg_change(pid_t fg_main_pid, u32 fg_uid);
+
 /* Aggregated counters for /proc/smart_io_sched/rl_stats. */
 void smart_io_rl_get_stats(struct smart_io_rl_stats *stats);
 
 /* Collection knobs (set from procfs; validated before use). */
 int  smart_io_rl_set_mode(u32 mode);
 u32  smart_io_rl_get_mode(void);
-int  smart_io_rl_set_fixed_action(u32 action);
-u32  smart_io_rl_get_fixed_action(void);
-int  smart_io_rl_set_random_probs(u32 vip_pct, u32 hp_pct, u32 rt_pct);
+int  smart_io_rl_set_elevate_pct(u32 pct);
+u32  smart_io_rl_get_elevate_pct(void);
 int  smart_io_rl_set_random_seed(u32 seed);
+/* S-gate (S-only random promotion): when enabled, RANDOM mode only rolls
+ * KEEP/ELEVATE while the main thread is in an S block interval; otherwise it
+ * forces KEEP. Default off = current behavior. */
+int  smart_io_rl_set_s_gate(bool enabled);
+bool smart_io_rl_get_s_gate(void);
+int  smart_io_rl_set_trace(bool enabled);
+bool smart_io_rl_trace_enabled(void);
 bool smart_io_rl_vip_action(u16 ioprio);
+/* Called from the queue selector when an RL-encoded ioprio decodes to an
+ * invalid action; counted for the decode-error fallback stat (doc §B1). */
+void smart_io_rl_note_decode_error(void);
 
 #endif

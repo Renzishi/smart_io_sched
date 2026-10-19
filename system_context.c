@@ -12,6 +12,7 @@
 #include "io_semantics.h"
 #include "smart_io_dirtyrate.h"
 #include "smart_io_log.h"
+#include "smart_io_rl.h"
 #include "system_context.h"
 #include "tp_filemap.h"
 #include "tp_pi.h"
@@ -238,6 +239,14 @@ void smart_io_set_fg_uid(uid_t uid)
 	if (uid == atomic_read(&fg_uid))
 		return;
 	atomic_set(&fg_uid, uid);
+	/*
+	 * fg_uid is the reliable foreground-epoch boundary. The main-thread
+	 * identity is fg_uid + pid==tgid, so a new foreground app means a new
+	 * main thread; reset the tracked block interval so the new epoch starts
+	 * clean. fg_main_pid changes do NOT reset it (that write is late/stale
+	 * and would clear the interval mid-epoch).
+	 */
+	smart_io_rl_note_fg_change(-1, (u32)uid);
 	smart_io_dirtyrate_fg_uid_changed();
 }
 
@@ -263,6 +272,13 @@ void smart_io_set_fg_main_pid(pid_t pid)
 		return;
 	smart_io_pi_clear_owner("fg_main_pid_change");
 	atomic_set(&fg_main_pid, pid);
+	/*
+	 * fg_main_pid is deliberately NOT used for main-thread identity and does
+	 * not reset the main-thread block-interval tracker: the framework writes
+	 * it late (often ~1-2 s after a launch) and stale, so a reset here would
+	 * clear the interval mid-epoch. The epoch boundary is fg_uid
+	 * (smart_io_set_fg_uid), where the tracker is reset instead.
+	 */
 	// u64 u_s_time = 0;
 	// bool valid = smart_io_snapshot_task_state(pid, NULL, NULL, &u_s_time);
 	// if (valid) {
