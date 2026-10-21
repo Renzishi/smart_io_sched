@@ -2,6 +2,7 @@
 
 #include "block_helper.h"
 #include "smart_io_prio_policy.h"
+#include "linux/compiler_attributes.h"
 #include "smart_io_rl.h"
 #include "linux/blk_types.h"
 #include "system_context.h"
@@ -57,7 +58,7 @@ static u16 set_private_hint(u16 ioprio, u16 hint)
 		IOPRIO_PRIO_LEVEL(ioprio), old_hint | hint);
 }
 
-static bool is_special_read(u16 ioprio, blk_opf_t opf,
+static bool __maybe_unused is_special_read(u16 ioprio, blk_opf_t opf,
 					   unsigned int op)
 {
 	return (IOPRIO_PRIO_CLASS(ioprio) == IOPRIO_CLASS_RT ||
@@ -67,8 +68,9 @@ static bool is_special_read(u16 ioprio, blk_opf_t opf,
 static bool current_can_mark_hp(u16 ioprio,
 						  blk_opf_t opf, unsigned int op)
 {
-	return current_uid_is_fg() ||
-		is_special_read(ioprio, opf, op);
+	return current_uid_is_fg();
+	// return current_uid_is_fg() ||
+	// 	is_special_read(ioprio, opf, op);
 }
 
 static bool current_can_mark_vip(u16 ioprio,
