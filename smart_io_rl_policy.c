@@ -326,6 +326,128 @@ int smart_io_rl_policy_decide(const struct smart_io_rl_state *state,
 	return 0;
 }
 
+/* ----------------------------------------------------------------------
+ * Per-app explicit rules (v7): static fg-uid table for the seven trained
+ * apps; each entry selects one distilled IQL rule (extract_rules_v7.py,
+ * dataset_v7). The decision space is in-S requests only (out-of-S -> KEEP,
+ * same contract as S_ELEVATE); an unknown fg uid keeps the safe baseline
+ * path (KEEP).
+ *
+ * Thresholds are expressed in RAW state units (the offline distillation
+ * worked on log2-bucketed features; bucket <= b  <=>  raw < 2^(b+1)):
+ *   feishu  : ELEVATE iff uid_class <= 1 && w_lat_us <= 7
+ *             (s_w_lat bucket <= 2)
+ *   douyin  : KEEP iff uid_class <= 1 && rl_vip_inflight >= 2 &&
+ *             rl_vip_wait_bytes < 16384 (s_rl_vip_f bucket > 0.5,
+ *             s_rl_vip_wb bucket <= 13)
+ */
+enum smart_io_app_rule_kind {
+	SMART_IO_APP_RULE_KEEP = 0,  /* always KEEP (youtube) */
+	SMART_IO_APP_RULE_ELEVATE,   /* always ELEVATE while in S */
+	SMART_IO_APP_RULE_FEISHU,
+	SMART_IO_APP_RULE_DOUYIN,
+};
+
+struct smart_io_app_rule {
+	u32 uid;
+	u8 kind;
+};
+
+/* fg uids on device 0826420000013679 (adb pm list packages -U). */
+static const struct smart_io_app_rule app_rules[] = {
+	{ 10232, SMART_IO_APP_RULE_KEEP },     /* youtube */
+	{ 10271, SMART_IO_APP_RULE_FEISHU },   /* feishu */
+	{ 10272, SMART_IO_APP_RULE_ELEVATE },  /* toutiao */
+	{ 10273, SMART_IO_APP_RULE_KEEP },     /* taobao (v8 retrain: KEEP) */
+	{ 10274, SMART_IO_APP_RULE_KEEP },     /* cloudmusic (v8 retrain: KEEP) */
+	{ 10275, SMART_IO_APP_RULE_ELEVATE },  /* douyin (v8 retrain: ELEVATE) */
+	{ 10276, SMART_IO_APP_RULE_ELEVATE },  /* tiktok_Asia */
+};
+
+int smart_io_rl_policy_app_rules(const struct smart_io_rl_state *state,
+				 u32 fg_uid, u8 *action)
+{
+	unsigned int i;
+	u8 kind = SMART_IO_APP_RULE_KEEP;
+
+	if (!state || !action)
+		return -EINVAL;
+	*action = SMART_IO_RL_ACTION_KEEP;
+	if (!smart_io_rl_main_in_s())
+		return 0;
+	for (i = 0; i < ARRAY_SIZE(app_rules); i++) {
+		if (app_rules[i].uid == fg_uid) {
+			kind = app_rules[i].kind;
+			break;
+		}
+	}
+	switch (kind) {
+	case SMART_IO_APP_RULE_ELEVATE:
+		*action = SMART_IO_RL_ACTION_ELEVATE;
+		break;
+	case SMART_IO_APP_RULE_FEISHU:
+		if (state->uid_class <= 1 && state->device.w_lat_us <= 7)
+			*action = SMART_IO_RL_ACTION_ELEVATE;
+		break;
+	case SMART_IO_APP_RULE_DOUYIN:
+		if (!(state->uid_class <= 1 &&
+		      state->rl_vip_inflight >= 2 &&
+		      state->rl_vip_wait_bytes < 16384))
+			*action = SMART_IO_RL_ACTION_ELEVATE;
+		break;
+	default:
+		break;
+	}
+	return 0;
+}
+
+/* High-tag conditional rule (Arm B of the 2-arm launch RCT). Decision space
+ * is in-S READ requests only (out-of-S -> KEEP; protected requests are
+ * filtered upstream in smart_io_rl_classify). While the fg main thread is in
+ * an S block interval, ELEVATE iff the device tag occupancy (tag_used /
+ * tag_max) is >= 50%; otherwise KEEP. O(1) integer math, no sleep/alloc/lock.
+ */
+int smart_io_rl_policy_hightag(const struct smart_io_rl_state *state,
+			       u8 *action)
+{
+	if (!state || !action)
+		return -EINVAL;
+	*action = SMART_IO_RL_ACTION_KEEP;
+	if (!smart_io_rl_main_in_s())
+		return 0;
+	if (state->device.tag_max > 0 &&
+	    (u64)state->device.tag_used * 100U >= (u64)state->device.tag_max * 50U)
+		*action = SMART_IO_RL_ACTION_ELEVATE;
+	return 0;
+}
+
+/* Explicit all-KEEP policy (Arm A of the per-launch interleaved RCT). Always
+ * KEEP so Arm A runs through the same MODEL code path as Arm B (only the
+ * policy id differs). No sleep/alloc/lock. */
+int smart_io_rl_policy_keep(const struct smart_io_rl_state *state, u8 *action)
+{
+	if (!state || !action)
+		return -EINVAL;
+	*action = SMART_IO_RL_ACTION_KEEP;
+	return 0;
+}
+
+/* Full in-S ELEVATE (Arm B of the per-launch interleaved RCT): ELEVATE while
+ * the fg main thread is in an S block interval, KEEP otherwise. The RL path
+ * only sees READ requests (WRITE stays baseline; protected requests are
+ * filtered upstream in smart_io_rl_classify), so this elevates all safe in-S
+ * READs with full exposure. No sleep/alloc/lock. */
+int smart_io_rl_policy_elevate_read(const struct smart_io_rl_state *state,
+				    u8 *action)
+{
+	if (!state || !action)
+		return -EINVAL;
+	*action = SMART_IO_RL_ACTION_KEEP;
+	if (smart_io_rl_main_in_s())
+		*action = SMART_IO_RL_ACTION_ELEVATE;
+	return 0;
+}
+
 void smart_io_rl_policy_set_enabled(bool on)
 {
 	WRITE_ONCE(rl_policy.enabled, on);

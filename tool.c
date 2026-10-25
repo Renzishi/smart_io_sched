@@ -79,15 +79,25 @@ u8 match_thread_role(uid_t uid, pid_t pid, pid_t tid, const char *comm, uid_t fg
 		return ROLE_UNKNOWN;
 	}
 
-	if (uid >= 10000) {
-		if (uid == fg_uid) {
-			if (strstr(comm, "RenderThread") || strstr(comm, "GLThread") ||
-				pid == tid)
-				return ROLE_UX;
-			return ROLE_FRONT;
-		}
-		return ROLE_BACK;
+	if (uid == fg_uid) {
+		if (strstr(comm, "binder"))
+			return ROLE_FRONT_BINDER;
+		if (strstr(comm, "RenderThread") || strstr(comm, "GLThread") ||
+			pid == tid)
+			return ROLE_UX;
+		return ROLE_FRONT_WORKER;
 	}
+
+	if (uid == 1000) {
+		if (strstr(comm, "binder"))
+			return ROLE_SYS_BINDER;
+		if (pid == tid)
+			return ROLE_SYS_MAIN;
+		return ROLE_SYS_WORKER;
+	}
+
+	if (uid >= 10000)
+		return ROLE_BACK;
 
 	return ROLE_UNKNOWN;
 }

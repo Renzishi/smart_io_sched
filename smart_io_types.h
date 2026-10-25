@@ -63,6 +63,11 @@ enum smart_io_thread_role {
 	ROLE_KWORKER = 4,
 	ROLE_FS_BACK = 5,
 	ROLE_FIO = 6,
+	ROLE_FRONT_WORKER = 7,
+	ROLE_FRONT_BINDER = 8,
+	ROLE_SYS_MAIN = 9,
+	ROLE_SYS_BINDER = 10,
+	ROLE_SYS_WORKER = 11,
 };
 
 enum smart_io_device_type {

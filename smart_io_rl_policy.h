@@ -73,6 +73,34 @@ void smart_io_rl_policy_set_enabled(bool on);
 int smart_io_rl_policy_decide(const struct smart_io_rl_state *state,
 			      u32 fg_uid, u8 *action);
 
+/* Per-uid v7 explicit rules (static table, see smart_io_rl_policy.c).
+ * In-S-only decision space (out-of-S -> KEEP); unknown fg uid -> KEEP.
+ * Returns 0 and sets *action. Hot path: no sleep, no alloc, no lock. */
+int smart_io_rl_policy_app_rules(const struct smart_io_rl_state *state,
+				 u32 fg_uid, u8 *action);
+
+/* High-tag conditional rule (Arm B of the 2-arm launch RCT): in-S-only
+ * decision space (out-of-S -> KEEP; protected requests are filtered upstream
+ * in smart_io_rl_classify). While the fg main thread is in an S block
+ * interval, ELEVATE iff the device tag occupancy (tag_used/tag_max) is >= 50%;
+ * otherwise KEEP. Returns 0 and sets *action. Hot path: no sleep, no alloc,
+ * no lock. */
+int smart_io_rl_policy_hightag(const struct smart_io_rl_state *state,
+			       u8 *action);
+
+/* Explicit all-KEEP policy (Arm A of the per-launch interleaved RCT). Always
+ * KEEP so Arm A runs through the same MODEL code path as Arm B. Returns 0 and
+ * sets *action. Hot path: no sleep, no alloc, no lock. */
+int smart_io_rl_policy_keep(const struct smart_io_rl_state *state, u8 *action);
+
+/* Full in-S ELEVATE (Arm B of the per-launch interleaved RCT): ELEVATE while
+ * the fg main thread is in an S block interval, KEEP otherwise. The RL path
+ * only sees READ requests (WRITE stays baseline; protected requests are
+ * filtered upstream in smart_io_rl_classify), so this elevates all safe in-S
+ * READs. Returns 0 and sets *action. Hot path: no sleep, no alloc, no lock. */
+int smart_io_rl_policy_elevate_read(const struct smart_io_rl_state *state,
+				    u8 *action);
+
 /* Status for /proc/smart_io_sched/rl_policy_status. */
 void smart_io_rl_policy_status(u8 *version, u8 *n_dims, u32 *table_size,
 			       u32 *app_uid, bool *loaded, bool *enabled,

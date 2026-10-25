@@ -1150,6 +1150,35 @@ static ssize_t rl_s_gate_write(struct file *f, const char __user *ub, size_t c,
 	return smart_io_rl_set_s_gate(val != 0) ? -EINVAL : c;
 }
 
+static int rl_policy_id_show(struct seq_file *m, void *v)
+{
+	seq_printf(m, "%u\n", smart_io_rl_get_policy_id());
+	return 0;
+}
+
+static int rl_policy_id_open(struct inode *i, struct file *f)
+{
+	return single_open(f, rl_policy_id_show, NULL);
+}
+
+static ssize_t rl_policy_id_write(struct file *f, const char __user *ub, size_t c,
+				  loff_t *p)
+{
+	int val;
+	char buf[8];
+
+	if (c > sizeof(buf) - 1)
+		return -EINVAL;
+	if (copy_from_user(buf, ub, c))
+		return -EFAULT;
+	buf[c] = 0;
+	if (kstrtoint(strstrip(buf), 10, &val))
+		return -EINVAL;
+	if (val < 0)
+		return -EINVAL;
+	return smart_io_rl_set_policy_id((u32)val) ? -EINVAL : c;
+}
+
 static int rl_stats_show(struct seq_file *m, void *v)
 {
 	struct smart_io_rl_stats st;
@@ -1159,6 +1188,7 @@ static int rl_stats_show(struct seq_file *m, void *v)
 	seq_printf(m, "elevate_pct=%u\n", st.rl_elevate_pct);
 	seq_printf(m, "random_seed=%u\n", st.rl_random_seed);
 	seq_printf(m, "s_gate=%u\n", st.rl_s_gate);
+	seq_printf(m, "policy_id=%u\n", st.rl_policy_id);
 	seq_printf(m, "main_in_s_count=%llu\n",
 		   (unsigned long long)st.rl_main_in_s_count);
 	seq_printf(m, "rl_decision_count=%llu\n",
@@ -1590,6 +1620,18 @@ struct proc_node proc_nodes[] = {
 			.proc_open = rl_s_gate_open,
 			.proc_read = seq_read,
 			.proc_write = rl_s_gate_write,
+			.proc_lseek = seq_lseek,
+			.proc_release = single_release,
+		},
+		.mode = 0644,
+		.exist = false,
+	},
+	{
+		.name = "rl_policy_id",
+		.ops = &(struct proc_ops){
+			.proc_open = rl_policy_id_open,
+			.proc_read = seq_read,
+			.proc_write = rl_policy_id_write,
 			.proc_lseek = seq_lseek,
 			.proc_release = single_release,
 		},

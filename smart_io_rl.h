@@ -58,6 +58,40 @@ struct smart_io_rl_device_snapshot {
 
 #define SMART_IO_RL_MODE_MAX     2U
 
+/*
+ * MODEL-path policy ids (doc §Phase 3): when rl_mode == MODEL the
+ * classify path calls exactly one of these policy functions. More policies
+ * can be appended here; the MODEL path dispatches on the selected id.
+ *   S_ELEVATE : the rule extracted from the sg_v3 offline study - ELEVATE
+ *               while the fg main thread is in an S block interval, KEEP
+ *               otherwise (in-S-only decision space).
+ *   TABLE     : the offline-quantized decision table (smart_io_rl_policy.c);
+ *               the original MODEL-path behaviour.
+ *   APP_RULES : per-uid explicit rules distilled from the v7 7-app IQL
+ *               study (smart_io_rl_policy.c): the rule is selected by the
+ *               fg uid; in-S-only decision space; unknown uid -> KEEP.
+ *   HIGHTAG   : high-tag conditional rule (Arm B of the 2-arm launch RCT):
+ *               in-S-only decision space; ELEVATE while the fg main thread
+ *               is in an S block interval AND the device tag occupancy
+ *               (tag_used/tag_max) is >= 50%, KEEP otherwise.
+ *   KEEP      : explicit all-KEEP policy (Arm A of the per-launch interleaved
+ *               RCT). Always KEEP. Exists so Arm A runs through the same
+ *               MODEL code path as Arm B (only the policy id differs).
+ *   ELEVATE_READ : full in-S ELEVATE (Arm B of the per-launch interleaved RCT):
+ *               ELEVATE while the fg main thread is in an S block interval,
+ *               KEEP otherwise. The RL path only sees READ requests (WRITE
+ *               stays baseline), so this elevates all safe in-S READs.
+ */
+enum smart_io_rl_policy_id {
+	SMART_IO_RL_POLICY_S_ELEVATE = 0,
+	SMART_IO_RL_POLICY_TABLE = 1,
+	SMART_IO_RL_POLICY_APP_RULES = 2,
+	SMART_IO_RL_POLICY_HIGHTAG = 3,
+	SMART_IO_RL_POLICY_KEEP = 4,
+	SMART_IO_RL_POLICY_ELEVATE_READ = 5,
+	SMART_IO_RL_POLICY_MAX,
+};
+
 enum smart_io_rl_uid_class {
 	SMART_IO_RL_UID_UNKNOWN = 0,
 	SMART_IO_RL_UID_ROOT,
@@ -188,6 +222,7 @@ struct smart_io_rl_stats {
 	u32 rl_random_seed;
 	u32 rl_s_gate;        /* S-gate: only promote while main thread is in S */
 	u64 rl_main_in_s_count; /* decisions made while main thread was in S */
+	u32 rl_policy_id;     /* selected MODEL-path policy (enum smart_io_rl_policy_id) */
 };
 
 /*
@@ -232,6 +267,9 @@ int  smart_io_rl_set_random_seed(u32 seed);
  * forces KEEP. Default off = current behavior. */
 int  smart_io_rl_set_s_gate(bool enabled);
 bool smart_io_rl_get_s_gate(void);
+/* MODEL-path policy selector (enum smart_io_rl_policy_id). */
+int  smart_io_rl_set_policy_id(u32 id);
+u32  smart_io_rl_get_policy_id(void);
 int  smart_io_rl_set_trace(bool enabled);
 bool smart_io_rl_trace_enabled(void);
 bool smart_io_rl_vip_action(u16 ioprio);

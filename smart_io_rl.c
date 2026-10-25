@@ -40,6 +40,10 @@ static atomic_t rl_s_gate = ATOMIC_INIT(0);
 /* Decisions made while the main thread was in an S block interval (S-gate
  * verification: expected == rl_decision_count when the gate is active). */
 static atomic_t rl_main_in_s_count = ATOMIC_INIT(0);
+/* Selected MODEL-path policy (enum smart_io_rl_policy_id). S_ELEVATE (the rule
+ * extracted from the sg_v3 offline study) is the default; TABLE is the
+ * original offline-quantized decision table. */
+static atomic_t rl_policy_id = ATOMIC_INIT(SMART_IO_RL_POLICY_S_ELEVATE);
 
 /* Per-CPU LCG streams for random collection (race-free in spinlock context).
  * Each CPU derives an independent stream from the configured seed so
@@ -333,20 +337,61 @@ static u16 smart_io_rl_encode(u16 ioprio, u8 action)
 	return IOPRIO_PRIO_VALUE_HINT(ioprio_class, level, hint);
 }
 
+/*
+ * MODEL-path policy: S_ELEVATE (the rule extracted from the sg_v3 offline
+ * study). The decision space is in-S requests only: ELEVATE while the fg
+ * main thread is in an S block interval, KEEP otherwise. O(1), no table
+ * lookup, no allocation.
+ */
+static int smart_io_rl_policy_s_elevate(const struct smart_io_rl_state *state,
+					u8 *action)
+{
+	*action = smart_io_rl_main_in_s() ? SMART_IO_RL_ACTION_ELEVATE
+					  : SMART_IO_RL_ACTION_KEEP;
+	return 0;
+}
+
 int smart_io_rl_model_action(const struct smart_io_rl_state *state, u8 *action)
 {
 	int fg_uid;
+	unsigned int id;
 
-	/* MODEL mode (doc §Phase 3): the learned policy is deployed as an
-	 * offline-quantized decision table (smart_io_rl_policy.c), not as
-	 * network weights. The table lookup is O(1) integer math; when no
-	 * table is loaded / enabled / matched, it returns -EOPNOTSUPP and the
-	 * caller falls back to KEEP (safe baseline path). */
+	/* MODEL mode (doc §Phase 3): dispatch to the selected policy function.
+	 * S_ELEVATE is the extracted rule (default); TABLE is the original
+	 * offline-quantized decision table (smart_io_rl_policy.c) - O(1) integer
+	 * math, returns -EOPNOTSUPP (caller falls back to KEEP) when no table is
+	 * loaded / enabled / matched. More policies can be appended here. */
 	if (!state || !action)
 		return -EINVAL;
+	id = (unsigned int)atomic_read(&rl_policy_id);
+	if (id == SMART_IO_RL_POLICY_S_ELEVATE)
+		return smart_io_rl_policy_s_elevate(state, action);
+	if (id == SMART_IO_RL_POLICY_HIGHTAG)
+		return smart_io_rl_policy_hightag(state, action);
+	if (id == SMART_IO_RL_POLICY_KEEP)
+		return smart_io_rl_policy_keep(state, action);
+	if (id == SMART_IO_RL_POLICY_ELEVATE_READ)
+		return smart_io_rl_policy_elevate_read(state, action);
 	fg_uid = smart_io_get_fg_uid();
+	if (id == SMART_IO_RL_POLICY_APP_RULES)
+		return smart_io_rl_policy_app_rules(state,
+						    (u32)(fg_uid >= 0 ? fg_uid : 0),
+						    action);
 	return smart_io_rl_policy_decide(state, (u32)(fg_uid >= 0 ? fg_uid : 0),
 					 action);
+}
+
+int smart_io_rl_set_policy_id(u32 id)
+{
+	if (id >= SMART_IO_RL_POLICY_MAX)
+		return -EINVAL;
+	atomic_set(&rl_policy_id, (int)id);
+	return 0;
+}
+
+u32 smart_io_rl_get_policy_id(void)
+{
+	return (u32)atomic_read(&rl_policy_id);
 }
 
 int smart_io_rl_decode_action(u16 ioprio)
@@ -611,6 +656,7 @@ void smart_io_rl_get_stats(struct smart_io_rl_stats *stats)
 	stats->rl_random_seed = (u32)atomic_read(&rl_random_seed);
 	stats->rl_s_gate = (u32)atomic_read(&rl_s_gate);
 	stats->rl_main_in_s_count = (u64)atomic_read(&rl_main_in_s_count);
+	stats->rl_policy_id = (u32)atomic_read(&rl_policy_id);
 }
 
 int smart_io_rl_set_mode(u32 mode)
