@@ -871,6 +871,105 @@ static struct request *dd_dispatch_fifo(struct deadline_data *dd,
 	return rq;
 }
 
+/*
+ * Token-aware dispatch for the HP priority queue. The HP queue holds both VIP
+ * (UX reads) and non-VIP (foreground regular reads) requests; each has its own
+ * in-flight token cap (vip_ok / nonvip_ok). A request whose class is at its
+ * cap is skipped so a capped VIP at the head does not head-of-line-block a
+ * dispatchable non-VIP behind it. Selection otherwise mirrors
+ * dd_dispatch_fifo(). Caller holds dd->lock.
+ */
+static struct request *dd_dispatch_hp(struct deadline_data *dd,
+				      struct dd_per_prio *per_prio,
+				      bool vip_ok, bool nonvip_ok)
+{
+	struct request *rq;
+	struct list_head *pos;
+
+	if (!vip_ok && !nonvip_ok)
+		return NULL;
+
+	/* Head-inserted request (BLK_MQ_INSERT_AT_HEAD): honor its class. */
+	if (!list_empty(&per_prio->dispatch)) {
+		rq = list_first_entry(&per_prio->dispatch, struct request,
+				      queuelist);
+		if ((is_vip_request(rq) && vip_ok) ||
+		    (!is_vip_request(rq) && nonvip_ok))
+			goto selected;
+	}
+
+	/* A VIP at the head of the read/write fifo (highest priority). */
+	if (vip_ok) {
+		struct request *vr =
+			list_first_entry_or_null(&per_prio->fifo_list[DD_READ],
+				struct request, queuelist);
+		struct request *vw =
+			list_first_entry_or_null(&per_prio->fifo_list[DD_WRITE],
+				struct request, queuelist);
+		u64 vr_id, vw_id;
+
+		if (vr && !is_vip_request(vr))
+			vr = NULL;
+		if (vw && !is_vip_request(vw))
+			vw = NULL;
+		if (vr || vw) {
+			if (!vr)
+				rq = vw;
+			else if (!vw)
+				rq = vr;
+			else {
+				vr_id = smart_io_throttle_request_id(vr);
+				vw_id = smart_io_throttle_request_id(vw);
+				rq = vr_id && vw_id ?
+					vr_id < vw_id ? vr : vw :
+					time_before((unsigned long)vr->fifo_time,
+						    (unsigned long)vw->fifo_time) ?
+						vr : vw;
+			}
+			goto selected;
+		}
+	}
+
+	/* First non-VIP in the read/write fifo (skip any leading VIPs). */
+	if (nonvip_ok) {
+		struct request *r = NULL, *w = NULL;
+
+		list_for_each(pos, &per_prio->fifo_list[DD_READ]) {
+			rq = list_entry(pos, struct request, queuelist);
+			if (!is_vip_request(rq)) {
+				r = rq;
+				break;
+			}
+		}
+		list_for_each(pos, &per_prio->fifo_list[DD_WRITE]) {
+			rq = list_entry(pos, struct request, queuelist);
+			if (!is_vip_request(rq)) {
+				w = rq;
+				break;
+			}
+		}
+		if (r || w) {
+			if (!r)
+				rq = w;
+			else if (!w)
+				rq = r;
+			else
+				rq = time_before((unsigned long)r->fifo_time,
+						 (unsigned long)w->fifo_time) ?
+					r : w;
+			goto selected;
+		}
+	}
+
+	return NULL;
+
+selected:
+	deadline_move_request(dd, per_prio, rq);
+	per_prio->stats.dispatched++;
+	rq->rq_flags |= RQF_STARTED;
+	return rq;
+}
+
 static void dd_insert_fifo_request(struct dd_per_prio *per_prio,
 					   struct request *rq,
 					   enum dd_data_dir data_dir)
@@ -891,20 +990,82 @@ static void dd_insert_fifo_request(struct dd_per_prio *per_prio,
 	per_prio->vip_tail[data_dir] = rq;
 }
 
+/*
+ * Fast-path head dispatch for the no-throttle case. The HP fifo keeps VIP
+ * requests at the head (dd_insert_fifo_request), so dispatching the head of
+ * the read/write fifo already honors VIP-before-HP ordering without the token
+ * checks or the non-VIP list scan done by dd_dispatch_hp(). Head-inserted
+ * requests (BLK_MQ_INSERT_AT_HEAD) still take precedence via the dispatch
+ * list. Equivalent to dd_dispatch_hp() with both token classes open.
+ * Caller holds dd->lock.
+ */
+static struct request *dd_dispatch_head(struct deadline_data *dd,
+					struct dd_per_prio *per_prio)
+{
+	struct request *rq;
+
+	if (!list_empty(&per_prio->dispatch)) {
+		rq = list_first_entry(&per_prio->dispatch, struct request,
+					queuelist);
+	} else {
+		struct request *read_rq = list_first_entry_or_null(
+			&per_prio->fifo_list[DD_READ], struct request,
+			queuelist);
+		struct request *write_rq = list_first_entry_or_null(
+			&per_prio->fifo_list[DD_WRITE], struct request,
+			queuelist);
+		if (!read_rq)
+			rq = write_rq;
+		else if (!write_rq)
+			rq = read_rq;
+		else
+			rq = time_before((unsigned long)read_rq->fifo_time,
+					 (unsigned long)write_rq->fifo_time) ?
+				read_rq : write_rq;
+	}
+	if (!rq)
+		return NULL;
+
+	deadline_move_request(dd, per_prio, rq);
+	per_prio->stats.dispatched++;
+	rq->rq_flags |= RQF_STARTED;
+	return rq;
+}
+
 static struct request *dd_dispatch_request(struct blk_mq_hw_ctx *hctx)
 {
 	struct deadline_data *dd = hctx->queue->elevator->elevator_data;
 	struct request *rq = NULL;
+	bool vip_ok, nonvip_ok;
 	enum smart_io_dispatch_selection selection =
 		SMART_IO_SELECTION_BACKGROUND_BASELINE;
 
 	smart_io_throttle_dispatch_model_if_needed(&dd->throttle);
 	spin_lock(&dd->lock);
-	rq = dd_dispatch_fifo(dd, &dd->per_prio[DD_HP_PRIO]);
-	if (!rq && smart_io_throttle_non_hp_allowed(&dd->throttle, SMART_IO_QUEUE_RT))
-		rq = dd_dispatch_fifo(dd, &dd->per_prio[DD_RT_PRIO]);
-	if (!rq && smart_io_throttle_non_hp_allowed(&dd->throttle, SMART_IO_QUEUE_BE))
-		rq = dd_dispatch_fifo(dd, &dd->per_prio[DD_BE_PRIO]);
+	if (!smart_io_throttle_enabled()) {
+		/*
+		 * No in-flight tokens: dispatch the head of each queue in
+		 * HP -> RT -> BE order. VIP requests already sit at the HP
+		 * fifo head, so this skips the token check and the list scan
+		 * with identical ordering.
+		 */
+		rq = dd_dispatch_head(dd, &dd->per_prio[DD_HP_PRIO]);
+		if (!rq)
+			rq = dd_dispatch_head(dd, &dd->per_prio[DD_RT_PRIO]);
+		if (!rq)
+			rq = dd_dispatch_head(dd, &dd->per_prio[DD_BE_PRIO]);
+	} else {
+		smart_io_throttle_hp_token_state(&dd->throttle, &vip_ok,
+						  &nonvip_ok);
+		rq = dd_dispatch_hp(dd, &dd->per_prio[DD_HP_PRIO], vip_ok,
+				    nonvip_ok);
+		if (!rq && smart_io_throttle_non_hp_allowed(&dd->throttle,
+						SMART_IO_QUEUE_RT))
+			rq = dd_dispatch_fifo(dd, &dd->per_prio[DD_RT_PRIO]);
+		if (!rq && smart_io_throttle_non_hp_allowed(&dd->throttle,
+						SMART_IO_QUEUE_BE))
+			rq = dd_dispatch_fifo(dd, &dd->per_prio[DD_BE_PRIO]);
+	}
 	if (rq)
 		smart_io_throttle_account_dispatch(&dd->throttle, rq, selection);
 	spin_unlock(&dd->lock);
@@ -1337,7 +1498,14 @@ bool smart_deadline_rq_is_foreground(const struct request *rq)
 	if (!elevator || READ_ONCE(elevator->type) != &smart_deadline_elevator)
 		return false;
 
-	return smart_io_throttle_rq_class(rq) == SMART_IO_RQ_FOREGROUND;
+	/*
+	 * Use the queue-class selection (authoritative meta when classified,
+	 * otherwise the ioprio hint) instead of the throttle request class,
+	 * which requires the throttle meta to be present. This keeps the
+	 * UFS high-priority (CP) marking working even when the throttle is
+	 * disabled (meta not allocated).
+	 */
+	return smart_io_throttle_select_queue(rq) == SMART_IO_QUEUE_HP;
 }
 
 int smart_deadline_init(void)

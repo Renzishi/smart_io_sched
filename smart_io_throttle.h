@@ -30,6 +30,19 @@ enum smart_io_queue_class {
 	SMART_IO_QUEUE_COUNT,
 };
 
+/* In-flight token budget classes. VIP/HP are the two sub-segments of the
+ * physical HP queue (VIP = UX reads, HP = foreground regular reads); RT and
+ * BE are their own physical queues. Each class gets an independent in-flight
+ * cap (queue_tokens[]); 0 = uncapped. The four caps form a partition of the
+ * hardware tag budget (32 on this device). */
+enum smart_io_token_class {
+	SMART_IO_TOKEN_VIP = 0,
+	SMART_IO_TOKEN_HP = 1,
+	SMART_IO_TOKEN_RT = 2,
+	SMART_IO_TOKEN_BE = 3,
+	SMART_IO_TOKEN_COUNT = 4,
+};
+
 enum smart_io_throttle_level {
 	SMART_IO_THROTTLE_NO,
 	SMART_IO_THROTTLE_LIGHT,
@@ -62,6 +75,7 @@ enum smart_io_gate_reason {
 	SMART_IO_GATE_NONE,
 	SMART_IO_GATE_INFERENCE,
 	SMART_IO_GATE_DEPTH,
+	SMART_IO_GATE_TOKEN,
 };
 
 enum smart_io_dispatch_selection {
@@ -274,6 +288,8 @@ struct smart_io_throttle_stats {
 	u32 bg_pending;
 	u32 dev_lat_threshold_us;
 	u32 background_deadline_ms;
+	u32 be_current_depth;
+	u32 queue_tokens[SMART_IO_TOKEN_COUNT];
 	bool deadline_forced_active;
 	u64 session_id;
 	u64 control_id;
@@ -360,6 +376,36 @@ int smart_io_throttle_set_dev_lat_threshold(u32 threshold_us);
 u32 smart_io_throttle_get_dev_lat_threshold(void);
 int smart_io_throttle_set_background_deadline_ms(u32 deadline_ms);
 u32 smart_io_throttle_get_background_deadline_ms(void);
+/* Per-class in-flight token caps (VIP/HP/RT/BE). 0 = uncapped for that
+ * class; no starvation backstop (pure concurrency limit). */
+int smart_io_throttle_set_queue_tokens(u32 vip, u32 hp, u32 rt, u32 be);
+void smart_io_throttle_get_queue_tokens(u32 *vip, u32 *hp, u32 *rt, u32 *be);
+/* Per-uid (per-app) in-flight token table: when the foreground app's uid has
+ * an entry, its tokens[] override the global queue_tokens for that app's IO.
+ * 0 = uncapped for that class. */
+#define SMART_IO_APP_TOKEN_MAX 16
+struct smart_io_app_token_entry {
+	u32 uid;
+	u32 tokens[SMART_IO_TOKEN_COUNT];
+	bool valid;
+};
+int smart_io_throttle_set_app_token(u32 uid, u32 vip, u32 hp, u32 rt, u32 be);
+int smart_io_throttle_clear_app_tokens(void);
+int smart_io_throttle_get_app_tokens(struct smart_io_app_token_entry *out,
+				     int max_entries);
+/* Floor policy: writes always go to BE, reads are never below RT. */
+int smart_io_throttle_set_inflight_floor(bool enabled);
+bool smart_io_throttle_get_inflight_floor(void);
+/* True when a request of token class tc may be dispatched (its in-flight
+ * count is below the token cap, or the class is uncapped). Caller must hold
+ * ctx->lock. */
+bool smart_io_throttle_token_class_allowed_locked(
+		const struct smart_io_throttle_ctx *ctx,
+		enum smart_io_token_class tc);
+/* Whether the VIP and non-VIP (HP) sub-segments of the HP queue may dispatch
+ * under the token caps (takes ctx->lock). */
+void smart_io_throttle_hp_token_state(struct smart_io_throttle_ctx *ctx,
+		bool *vip_ok, bool *nonvip_ok);
 int smart_io_throttle_set_ratios(u32 light_pct, u32 medium_pct,
 				 u32 heavy_pct);
 void smart_io_throttle_get_ratios(u32 *light_pct, u32 *medium_pct,

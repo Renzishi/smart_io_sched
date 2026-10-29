@@ -626,6 +626,136 @@ static const struct proc_ops background_deadline_ops = {
 	.proc_release = single_release,
 };
 
+/* queue_tokens: "vip hp rt be" per-class in-flight caps (0 = uncapped). */
+static ssize_t queue_tokens_write(struct file *f, const char __user *ub,
+				  size_t c, loff_t *p)
+{
+	char *buf;
+	u32 vip, hp, rt, be;
+	int ret, n;
+
+	if (c == 0 || c >= PAGE_SIZE)
+		return -EINVAL;
+	buf = memdup_user(ub, c);
+	if (IS_ERR(buf))
+		return PTR_ERR(buf);
+	n = sscanf(buf, "%u %u %u %u", &vip, &hp, &rt, &be);
+	kfree(buf);
+	if (n != 4)
+		return -EINVAL;
+	ret = smart_io_throttle_set_queue_tokens(vip, hp, rt, be);
+	return ret ? ret : c;
+}
+
+static int queue_tokens_show(struct seq_file *m, void *v)
+{
+	u32 vip, hp, rt, be;
+
+	smart_io_throttle_get_queue_tokens(&vip, &hp, &rt, &be);
+	seq_printf(m, "%u %u %u %u\n", vip, hp, rt, be);
+	return 0;
+}
+
+static int queue_tokens_open(struct inode *i, struct file *f)
+{
+	return single_open(f, queue_tokens_show, NULL);
+}
+
+static const struct proc_ops queue_tokens_ops = {
+	.proc_open = queue_tokens_open,
+	.proc_read = seq_read,
+	.proc_write = queue_tokens_write,
+	.proc_lseek = seq_lseek,
+	.proc_release = single_release,
+};
+
+/* inflight_floor: 1 = writes always BE, reads never below RT. */
+static ssize_t inflight_floor_write(struct file *f, const char __user *ub,
+				    size_t c, loff_t *p)
+{
+	u32 val;
+	int ret;
+
+	ret = proc_parse_u32(ub, c, &val);
+	if (ret)
+		return ret;
+	ret = smart_io_throttle_set_inflight_floor(val != 0);
+	return ret ? ret : c;
+}
+
+static int inflight_floor_show(struct seq_file *m, void *v)
+{
+	seq_printf(m, "%u\n",
+		   smart_io_throttle_get_inflight_floor() ? 1U : 0U);
+	return 0;
+}
+
+static int inflight_floor_open(struct inode *i, struct file *f)
+{
+	return single_open(f, inflight_floor_show, NULL);
+}
+
+static const struct proc_ops inflight_floor_ops = {
+	.proc_open = inflight_floor_open,
+	.proc_read = seq_read,
+	.proc_write = inflight_floor_write,
+	.proc_lseek = seq_lseek,
+	.proc_release = single_release,
+};
+
+/* app_token: "uid vip hp rt be" per-foreground-app in-flight caps (0 = uncapped).
+ * "clear" resets the table. Read shows the current entries. */
+static ssize_t app_token_write(struct file *f, const char __user *ub,
+			       size_t c, loff_t *p)
+{
+	char *buf;
+	u32 uid, vip, hp, rt, be;
+	int ret, n;
+
+	if (c == 0 || c >= PAGE_SIZE)
+		return -EINVAL;
+	buf = memdup_user(ub, c);
+	if (IS_ERR(buf))
+		return PTR_ERR(buf);
+	if (!strncmp(buf, "clear", 5)) {
+		kfree(buf);
+		ret = smart_io_throttle_clear_app_tokens();
+		return ret ? ret : c;
+	}
+	n = sscanf(buf, "%u %u %u %u %u", &uid, &vip, &hp, &rt, &be);
+	kfree(buf);
+	if (n != 5)
+		return -EINVAL;
+	ret = smart_io_throttle_set_app_token(uid, vip, hp, rt, be);
+	return ret ? ret : c;
+}
+
+static int app_token_show(struct seq_file *m, void *v)
+{
+	struct smart_io_app_token_entry entries[SMART_IO_APP_TOKEN_MAX];
+	int n, i;
+
+	n = smart_io_throttle_get_app_tokens(entries, SMART_IO_APP_TOKEN_MAX);
+	for (i = 0; i < n; i++)
+		seq_printf(m, "%u %u %u %u %u\n", entries[i].uid,
+			   entries[i].tokens[0], entries[i].tokens[1],
+			   entries[i].tokens[2], entries[i].tokens[3]);
+	return 0;
+}
+
+static int app_token_open(struct inode *i, struct file *f)
+{
+	return single_open(f, app_token_show, NULL);
+}
+
+static const struct proc_ops app_token_ops = {
+	.proc_open = app_token_open,
+	.proc_read = seq_read,
+	.proc_write = app_token_write,
+	.proc_lseek = seq_lseek,
+	.proc_release = single_release,
+};
+
 static ssize_t scene_tag_write(struct file *f, const char __user *ub, size_t c,
 			       loff_t *p)
 {
@@ -734,7 +864,7 @@ static int stats_show(struct seq_file *m, void *v)
 
 	smart_io_throttle_get_stats(&throttle_stats);
 	seq_printf(m,
-		   "io_throttle enabled:%u active:%u inference_pending:%u action_valid:%u source:%s session_id:%llu control_id:%llu decision_id:%llu level:%s policy:%s ratios:%u/%u/%u resolved_ratio:%u queue_max:%u target_depth:%u current_depth:%u bg_current_depth:%u reserved_depth:%u issued_depth:%u metadata:capacity=%u,inuse=%u pending:fg=%u,bg=%u gate:%s feedback:%s feedback_rq_id:%llu feedback_samples:count=%u,mean_dev_lat_us=%u,max_dev_lat_us=%u threshold_us:%u background_deadline_ms:%u deadline_forced_active:%u\n",
+		   "io_throttle enabled:%u active:%u inference_pending:%u action_valid:%u source:%s session_id:%llu control_id:%llu decision_id:%llu level:%s policy:%s ratios:%u/%u/%u resolved_ratio:%u queue_max:%u target_depth:%u current_depth:%u bg_current_depth:%u be_current_depth:%u queue_tokens:%u/%u/%u/%u reserved_depth:%u issued_depth:%u metadata:capacity=%u,inuse=%u pending:fg=%u,bg=%u gate:%s feedback:%s feedback_rq_id:%llu feedback_samples:count=%u,mean_dev_lat_us=%u,max_dev_lat_us=%u threshold_us:%u background_deadline_ms:%u deadline_forced_active:%u\n",
 		   throttle_stats.enabled ? 1U : 0U,
 		   throttle_stats.active ? 1U : 0U,
 		   throttle_stats.inference_pending ? 1U : 0U,
@@ -748,6 +878,11 @@ static int stats_show(struct seq_file *m, void *v)
 		   throttle_stats.heavy_pct, throttle_stats.resolved_ratio_pct,
 		   throttle_stats.queue_max, throttle_stats.target_depth,
 			 throttle_stats.current_depth, throttle_stats.bg_current_depth,
+			 throttle_stats.be_current_depth,
+			 throttle_stats.queue_tokens[SMART_IO_TOKEN_VIP],
+			 throttle_stats.queue_tokens[SMART_IO_TOKEN_HP],
+			 throttle_stats.queue_tokens[SMART_IO_TOKEN_RT],
+			 throttle_stats.queue_tokens[SMART_IO_TOKEN_BE],
 			 throttle_stats.current_depth,
 			 throttle_stats.issued_depth, throttle_stats.meta_capacity,
 		   throttle_stats.meta_inuse,
@@ -1451,6 +1586,24 @@ struct proc_node proc_nodes[] = {
 	{
 		.name = "background_deadline_ms",
 		.ops = &background_deadline_ops,
+		.mode = 0644,
+		.exist = false,
+	},
+	{
+		.name = "queue_tokens",
+		.ops = &queue_tokens_ops,
+		.mode = 0644,
+		.exist = false,
+	},
+	{
+		.name = "inflight_floor",
+		.ops = &inflight_floor_ops,
+		.mode = 0644,
+		.exist = false,
+	},
+	{
+		.name = "app_token",
+		.ops = &app_token_ops,
 		.mode = 0644,
 		.exist = false,
 	},

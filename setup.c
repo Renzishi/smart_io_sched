@@ -60,17 +60,17 @@ static int __init smart_io_init(void)
 		goto err_deadline;
 	}
 
-	ret = smart_io_dirtyrate_init();
-	if (ret) {
-		smart_io_log_err("smart_io_dirtyrate_init failed: %d\n", ret);
-		goto err_ufs;
-	}
+	// ret = smart_io_dirtyrate_init();
+	// if (ret) {
+	// 	smart_io_log_err("smart_io_dirtyrate_init failed: %d\n", ret);
+	// 	goto err_ufs;
+	// }
 
 	smart_io_log_info("module loaded. Tracepoint-based, GKI cautious.\n");
 	return 0;
 
-err_ufs:
-	smart_io_ufs_priority_exit();
+// err_ufs:
+// 	smart_io_ufs_priority_exit();
 err_deadline:
 	smart_deadline_exit();
 err_ctx:
@@ -99,6 +99,6 @@ static void __exit __maybe_unused smart_io_exit(void)
 }
 
 module_init(smart_io_init);
-/* module_exit(smart_io_exit); */
+module_exit(smart_io_exit);
 MODULE_LICENSE("GPL");
 MODULE_IMPORT_NS(MINIDUMP);

@@ -16,8 +16,7 @@ static void smart_io_ufs_send_command(void *unused, struct ufs_hba *hba,
 {
 	struct request *rq;
 
-	if (!smart_io_throttle_enabled() || !lrbp || !lrbp->cmd ||
-	    !lrbp->ucd_req_ptr)
+	if (!lrbp || !lrbp->cmd || !lrbp->ucd_req_ptr)
 		return;
 
 	rq = scsi_cmd_to_rq(lrbp->cmd);

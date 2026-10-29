@@ -59,6 +59,19 @@ static atomic_t rt_read_hp_enabled = ATOMIC_INIT(0);
 static atomic_t dev_lat_threshold_us = ATOMIC_INIT(SMART_IO_DEFAULT_DEV_LAT_US);
 static atomic_t background_deadline_ms =
 	ATOMIC_INIT(SMART_IO_DEFAULT_BACKGROUND_DEADLINE_MS);
+/* Per-class in-flight token caps (VIP/HP/RT/BE): 0 = uncapped for that
+ * class, n = max requests of that class in flight (dispatch to requeue/final
+ * complete). No starvation backstop. Runtime knob
+ * (/proc/smart_io_sched/queue_tokens). */
+static atomic_t queue_tokens[SMART_IO_TOKEN_COUNT];
+/* Floor policy: writes always BE, reads never below RT. */
+static atomic_t inflight_floor = ATOMIC_INIT(0);
+/* Per-uid (per-app) in-flight token table: when the foreground app's uid has
+ * an entry, its tokens[] override the global queue_tokens for that app's IO
+ * (the caps are applied to the per-queue in-flight counts). 0 = uncapped for
+ * that class. Written via /proc/smart_io_sched/app_token (rare); read
+ * lockless (READ_ONCE) in the dispatch hot path. */
+static struct smart_io_app_token_entry app_token_table[SMART_IO_APP_TOKEN_MAX];
 static DEFINE_SPINLOCK(throttle_config_lock);
 static struct smart_io_throttle_config throttle_config = {
 	.light_pct = SMART_IO_DEFAULT_LIGHT_PCT,
@@ -109,6 +122,7 @@ static const char * const gate_reason_names[] = {
 	[SMART_IO_GATE_NONE] = "none",
 	[SMART_IO_GATE_INFERENCE] = "inference",
 	[SMART_IO_GATE_DEPTH] = "depth",
+	[SMART_IO_GATE_TOKEN] = "token",
 };
 
 static const char * const feedback_state_names[] = {
@@ -188,12 +202,29 @@ smart_io_throttle_queue_from_ioprio(u16 ioprio)
 		SMART_IO_QUEUE_RT : SMART_IO_QUEUE_BE;
 }
 
+/* Floor policy (inflight_floor): writes always go to BE; reads are never
+ * below RT. Applied to a freshly derived queue class only (already
+ * classified requests carry the floored class in their metadata). */
+static enum smart_io_queue_class
+smart_io_throttle_floor_queue_class(enum smart_io_queue_class qc, bool is_write)
+{
+	if (!smart_io_throttle_get_inflight_floor())
+		return qc;
+	if (is_write)
+		return SMART_IO_QUEUE_BE;
+	if (qc == SMART_IO_QUEUE_BE)
+		return SMART_IO_QUEUE_RT;
+	return qc;
+}
+
 enum smart_io_queue_class
 smart_io_throttle_select_queue(const struct request *rq)
 {
 	u16 ioprio;
 	unsigned int op;
 	struct smart_io_rq_meta *meta;
+	enum smart_io_queue_class qc;
+	bool rl_resolved = false;
 
 	if (!rq)
 		return SMART_IO_QUEUE_BE;
@@ -205,60 +236,76 @@ smart_io_throttle_select_queue(const struct request *rq)
 	if (meta)
 		return meta->queue_class;
 	op = req_op((struct request *)rq);
-	if (op_is_write(op))
-		return has_smart_ioprio_hint(ioprio) ?
+	if (op_is_write(op)) {
+		qc = has_smart_ioprio_hint(ioprio) ?
 			SMART_IO_QUEUE_RT : SMART_IO_QUEUE_BE;
+	} else {
+		/*
+		 * RL-controlled READ (binary KEEP/ELEVATE, doc §B1): the RL
+		 * action bits (7-8) are authoritative. KEEP keeps the baseline
+		 * hint-driven route (HP/RT/BE); ELEVATE promotes into the HP
+		 * queue VIP segment. Check before the hint-bit rules so the
+		 * recorded decision wins.
+		 */
+		if (IOPRIO_PRIO_HINT(ioprio) & SMART_IO_RL_ACTION_MASK) {
+			int rl_action = smart_io_rl_decode_action(ioprio);
 
-	/*
-	 * RL-controlled READ (binary KEEP/ELEVATE, doc §B1): the RL action
-	 * bits (7-8) are authoritative. KEEP keeps the baseline hint-driven
-	 * route (HP/RT/BE); ELEVATE promotes into the HP queue VIP segment.
-	 * Check before the hint-bit rules so the recorded decision wins.
-	 */
-	if (IOPRIO_PRIO_HINT(ioprio) & SMART_IO_RL_ACTION_MASK) {
-		int rl_action = smart_io_rl_decode_action(ioprio);
-
-		if (rl_action == SMART_IO_RL_ACTION_ELEVATE)
-			return SMART_IO_QUEUE_HP;
-		if (rl_action == SMART_IO_RL_ACTION_KEEP) {
-			if (is_hp_ioprio(ioprio) || is_vip_ioprio(ioprio))
-				return SMART_IO_QUEUE_HP;
-			return smart_io_throttle_queue_from_ioprio(ioprio);
+			if (rl_action == SMART_IO_RL_ACTION_ELEVATE) {
+				qc = SMART_IO_QUEUE_HP;
+				rl_resolved = true;
+			} else if (rl_action == SMART_IO_RL_ACTION_KEEP) {
+				qc = (is_hp_ioprio(ioprio) || is_vip_ioprio(ioprio)) ?
+					SMART_IO_QUEUE_HP :
+					smart_io_throttle_queue_from_ioprio(ioprio);
+				rl_resolved = true;
+			} else if (rl_action < 0) {
+				smart_io_rl_note_decode_error();
+				qc = SMART_IO_QUEUE_HP;
+				rl_resolved = true;
+			}
 		}
-		if (rl_action < 0) {
-			smart_io_rl_note_decode_error();
-			return SMART_IO_QUEUE_HP;
+		if (!rl_resolved) {
+			/*
+			 * Hint-bit driven queue selection. All hint bits (HP,
+			 * PGF, PI, VIP, MAIN) are set at bio time by mark_bio_*
+			 * and carried into the request via rq->ioprio. No
+			 * re-derivation from current thread context.
+			 */
+			if (is_hp_ioprio(ioprio) || is_vip_ioprio(ioprio))
+				qc = SMART_IO_QUEUE_HP;
+			else
+				qc = smart_io_throttle_queue_from_ioprio(ioprio);
 		}
 	}
-	/*
-	 * Hint-bit driven queue selection. All hint bits (HP, PGF, PI, VIP,
-	 * MAIN) are set at bio time by mark_bio_* and carried into the request
-	 * via rq->ioprio. No re-derivation from current thread context.
-	 */
-	if (is_hp_ioprio(ioprio) || is_vip_ioprio(ioprio))
-		return SMART_IO_QUEUE_HP;
-
-	return smart_io_throttle_queue_from_ioprio(ioprio);
+	return smart_io_throttle_floor_queue_class(qc, op_is_write(op));
 }
 
 enum smart_io_queue_class
 smart_io_throttle_select_bio_queue(const struct bio *bio)
 {
+	unsigned int op;
+	enum smart_io_queue_class qc;
+
 	if (!bio)
 		return SMART_IO_QUEUE_BE;
-	if (op_is_write(bio_op(bio)))
-		return has_smart_ioprio_hint(bio->bi_ioprio) ?
+	op = bio_op(bio);
+	if (op_is_write(op)) {
+		qc = has_smart_ioprio_hint(bio->bi_ioprio) ?
 			SMART_IO_QUEUE_RT : SMART_IO_QUEUE_BE;
-	/*
-	 * Hint bits are set at bio-queue time by tp_bio_queue_cb (block_bio_queue
-	 * tracepoint), so by the time we reach dd_request_merge the bio already
-	 * carries its final source markers. No re-derivation from current.
-	 */
-	if (is_hp_ioprio(bio->bi_ioprio) ||
-	    has_smart_ioprio_hint(bio->bi_ioprio))
-		return SMART_IO_QUEUE_HP;
-
-	return smart_io_throttle_queue_from_ioprio(bio->bi_ioprio);
+	} else {
+		/*
+		 * Hint bits are set at bio-queue time by tp_bio_queue_cb
+		 * (block_bio_queue tracepoint), so by the time we reach
+		 * dd_request_merge the bio already carries its final source
+		 * markers. No re-derivation from current.
+		 */
+		if (is_hp_ioprio(bio->bi_ioprio) ||
+		    has_smart_ioprio_hint(bio->bi_ioprio))
+			qc = SMART_IO_QUEUE_HP;
+		else
+			qc = smart_io_throttle_queue_from_ioprio(bio->bi_ioprio);
+	}
+	return smart_io_throttle_floor_queue_class(qc, op_is_write(op));
 }
 
 int smart_io_throttle_set_ux_hp_enable(bool enabled)
@@ -642,6 +689,91 @@ static bool smart_io_throttle_depth_can_run_locked(
 	return true;
 }
 
+/* In-flight count of a token class (VIP/HP/RT/BE). Caller holds ctx->lock. */
+static u32 smart_io_throttle_token_inflight_locked(
+		const struct smart_io_throttle_ctx *ctx,
+		enum smart_io_token_class tc)
+{
+	switch (tc) {
+	case SMART_IO_TOKEN_VIP:
+		return ctx->hp_vip_inflight;
+	case SMART_IO_TOKEN_HP:
+		return ctx->hp_nonvip_inflight;
+	case SMART_IO_TOKEN_RT:
+		return ctx->rt_current_depth;
+	case SMART_IO_TOKEN_BE:
+		return ctx->be_current_depth;
+	default:
+		return 0;
+	}
+}
+
+/* Per-class in-flight token cap (independent of the RL throttle action).
+ * No starvation backstop: a class at its cap simply waits for its in-flight
+ * requests to complete and free a slot. */
+bool smart_io_throttle_token_class_allowed_locked(
+		const struct smart_io_throttle_ctx *ctx,
+		enum smart_io_token_class tc)
+{
+	u32 token;
+	int fg_uid = smart_io_get_fg_uid();
+	int i;
+
+	/* Per-uid (per-app) override: if the foreground app has an entry in
+	 * the app_token table, use its token for this class (0 = uncapped). */
+	if (fg_uid >= 0) {
+		for (i = 0; i < SMART_IO_APP_TOKEN_MAX; i++) {
+			if (READ_ONCE(app_token_table[i].valid) &&
+			    READ_ONCE(app_token_table[i].uid) == (u32)fg_uid) {
+				token = READ_ONCE(app_token_table[i].tokens[tc]);
+				if (token == 0)
+					return true;
+				return smart_io_throttle_token_inflight_locked(ctx, tc) < token;
+			}
+		}
+	}
+	/* Fallback to the global queue_tokens. */
+	token = (u32)atomic_read(&queue_tokens[tc]);
+
+	if (token == 0)
+		return true;
+	return smart_io_throttle_token_inflight_locked(ctx, tc) < token;
+}
+
+/* Map a physical queue class to its token class (RT/BE are 1:1; the HP
+ * queue is split into VIP/non-VIP at dispatch, handled by the caller). */
+static enum smart_io_token_class
+smart_io_throttle_token_class_for_queue(enum smart_io_queue_class queue_class)
+{
+	if (queue_class == SMART_IO_QUEUE_RT)
+		return SMART_IO_TOKEN_RT;
+	if (queue_class == SMART_IO_QUEUE_BE)
+		return SMART_IO_TOKEN_BE;
+	return SMART_IO_TOKEN_HP;
+}
+
+/* Whether the VIP and non-VIP (HP) sub-segments of the HP queue may dispatch
+ * under the token caps. Takes ctx->lock; fills both under one lock hold. When
+ * the throttle is disabled the caps do not apply (matches the RT/BE gate in
+ * smart_io_throttle_non_hp_allowed()). */
+void smart_io_throttle_hp_token_state(struct smart_io_throttle_ctx *ctx,
+		bool *vip_ok, bool *nonvip_ok)
+{
+	unsigned long flags;
+
+	if (!ctx || !smart_io_throttle_enabled()) {
+		*vip_ok = true;
+		*nonvip_ok = true;
+		return;
+	}
+	spin_lock_irqsave(&ctx->lock, flags);
+	*vip_ok = smart_io_throttle_token_class_allowed_locked(ctx,
+			SMART_IO_TOKEN_VIP);
+	*nonvip_ok = smart_io_throttle_token_class_allowed_locked(ctx,
+			SMART_IO_TOKEN_HP);
+	spin_unlock_irqrestore(&ctx->lock, flags);
+}
+
 static void smart_io_throttle_trace_decision(struct smart_io_throttle_ctx *ctx,
 					      const char *trigger,
 					      const char *result,
@@ -938,7 +1070,10 @@ static bool smart_io_throttle_release_depth_locked(struct smart_io_throttle_ctx 
 		}
 	}
 	if (ctx->gate_blocked &&
-	    smart_io_throttle_depth_can_run_locked(ctx, meta->queue_class)) {
+	    (ctx->gate_reason == SMART_IO_GATE_TOKEN ?
+	     smart_io_throttle_token_class_allowed_locked(
+		     ctx, smart_io_throttle_token_class_for_queue(meta->queue_class)) :
+	     smart_io_throttle_depth_can_run_locked(ctx, meta->queue_class))) {
 		*released_reason = ctx->gate_reason;
 		ctx->gate_blocked = false;
 		ctx->gate_reason = SMART_IO_GATE_NONE;
@@ -1723,6 +1858,8 @@ void smart_io_throttle_classify_request(struct smart_io_throttle_ctx *ctx,
 
 	if (!ctx || !rq)
 		return;
+	if (!smart_io_throttle_enabled())
+		return;
 
 	queue_class = smart_io_throttle_select_queue(rq);
 
@@ -1745,6 +1882,8 @@ void smart_io_throttle_update_request(struct smart_io_throttle_ctx *ctx,
 	unsigned long flags;
 
 	if (!ctx || !rq)
+		return;
+	if (!smart_io_throttle_enabled())
 		return;
 
 	spin_lock_irqsave(&ctx->lock, flags);
@@ -1769,6 +1908,8 @@ void smart_io_throttle_unqueue_request(struct smart_io_throttle_ctx *ctx,
 	unsigned long flags;
 
 	if (!ctx || !rq)
+		return;
+	if (!smart_io_throttle_enabled())
 		return;
 
 	spin_lock_irqsave(&ctx->lock, flags);
@@ -1802,6 +1943,8 @@ void smart_io_throttle_account_dispatch(struct smart_io_throttle_ctx *ctx,
 	bool wake = false;
 
 	if (!ctx || !rq)
+		return;
+	if (!smart_io_throttle_enabled())
 		return;
 
 	spin_lock_irqsave(&ctx->lock, flags);
@@ -1939,6 +2082,8 @@ void smart_io_throttle_finish_request(struct smart_io_throttle_ctx *ctx,
 
 	if (!ctx || !rq)
 		return;
+	if (!smart_io_throttle_enabled())
+		return;
 
 	spin_lock_irqsave(&ctx->lock, flags);
 	meta = smart_io_throttle_rq_meta(rq);
@@ -2031,7 +2176,7 @@ bool smart_io_throttle_has_pending(struct smart_io_throttle_ctx *ctx,
 	unsigned long flags;
 	u32 pending;
 
-	if (!ctx)
+	if (!ctx || !smart_io_throttle_enabled())
 		return false;
 	spin_lock_irqsave(&ctx->lock, flags);
 	pending = *smart_io_throttle_pending_counter(ctx, class);
@@ -2057,6 +2202,11 @@ bool smart_io_throttle_non_hp_allowed(struct smart_io_throttle_ctx *ctx,
 	if (!smart_io_throttle_get_queue_rq_demo() && ctx->inference_pending) {
 		allowed = false;
 		reason = SMART_IO_GATE_INFERENCE;
+	} else if (!smart_io_throttle_token_class_allowed_locked(
+		       ctx,
+		       smart_io_throttle_token_class_for_queue(queue_class))) {
+		allowed = false;
+		reason = SMART_IO_GATE_TOKEN;
 	} else if (!smart_io_throttle_get_queue_rq_demo() &&
 		   !smart_io_throttle_depth_can_run_locked(ctx, queue_class)) {
 		allowed = false;
@@ -2146,8 +2296,8 @@ bool smart_io_throttle_seq_match(struct smart_io_throttle_ctx *ctx,
 	unsigned long flags;
 	u32 budget;
 
-	if (!ctx || !rq || smart_io_throttle_rq_class(rq) !=
-		    SMART_IO_RQ_BACKGROUND)
+	if (!ctx || !rq || !smart_io_throttle_enabled() ||
+	    smart_io_throttle_rq_class(rq) != SMART_IO_RQ_BACKGROUND)
 		return false;
 
 	op = req_op((struct request *)rq);
@@ -2475,6 +2625,8 @@ void smart_io_throttle_record_issue(struct request *rq)
 
 	if (!rq || !rq->q)
 		return;
+	if (!smart_io_throttle_enabled())
+		return;
 
 	rcu_read_lock();
 	ctx = smart_io_throttle_find_ctx_rcu(rq->q);
@@ -2551,6 +2703,8 @@ void smart_io_throttle_record_requeue(struct request *rq)
 	bool wake = false;
 
 	if (!rq || !rq->q)
+		return;
+	if (!smart_io_throttle_enabled())
 		return;
 
 	rcu_read_lock();
@@ -2638,6 +2792,8 @@ void smart_io_throttle_record_complete(struct request *rq, blk_status_t status,
 	bool wake = false;
 
 	if (!rq || !rq->q)
+		return;
+	if (!smart_io_throttle_enabled())
 		return;
 	final = !rq->bio || nr_bytes >= blk_rq_bytes(rq);
 
@@ -2873,6 +3029,116 @@ u32 smart_io_throttle_get_background_deadline_ms(void)
 	return (u32)atomic_read(&background_deadline_ms);
 }
 
+int smart_io_throttle_set_queue_tokens(u32 vip, u32 hp, u32 rt, u32 be)
+{
+	u32 values[SMART_IO_TOKEN_COUNT] = { vip, hp, rt, be };
+	int i;
+
+	for (i = 0; i < SMART_IO_TOKEN_COUNT; i++) {
+		if (values[i] > INT_MAX)
+			return -EINVAL;
+		atomic_set(&queue_tokens[i], values[i]);
+	}
+	return 0;
+}
+
+void smart_io_throttle_get_queue_tokens(u32 *vip, u32 *hp, u32 *rt, u32 *be)
+{
+	u32 values[SMART_IO_TOKEN_COUNT];
+	int i;
+
+	for (i = 0; i < SMART_IO_TOKEN_COUNT; i++)
+		values[i] = (u32)atomic_read(&queue_tokens[i]);
+	*vip = values[0];
+	*hp = values[1];
+	*rt = values[2];
+	*be = values[3];
+}
+
+/* Set a per-uid (per-app) in-flight token entry. Updates an existing entry
+ * for the uid, or fills a free slot. 0 in any class = uncapped for that class. */
+int smart_io_throttle_set_app_token(u32 uid, u32 vip, u32 hp, u32 rt, u32 be)
+{
+	u32 values[SMART_IO_TOKEN_COUNT] = { vip, hp, rt, be };
+	unsigned long flags;
+	int i;
+	int slot = -1;
+
+	if (uid == 0)
+		return -EINVAL;
+	for (i = 0; i < SMART_IO_TOKEN_COUNT; i++) {
+		if (values[i] > INT_MAX)
+			return -EINVAL;
+	}
+
+	spin_lock_irqsave(&throttle_config_lock, flags);
+	for (i = 0; i < SMART_IO_APP_TOKEN_MAX; i++) {
+		if (app_token_table[i].valid && app_token_table[i].uid == uid) {
+			slot = i;
+			break;
+		}
+		if (!app_token_table[i].valid && slot < 0)
+			slot = i;
+	}
+	if (slot < 0) {
+		spin_unlock_irqrestore(&throttle_config_lock, flags);
+		return -ENOSPC;
+	}
+	app_token_table[slot].uid = uid;
+	for (i = 0; i < SMART_IO_TOKEN_COUNT; i++)
+		app_token_table[slot].tokens[i] = values[i];
+	app_token_table[slot].valid = true;
+	spin_unlock_irqrestore(&throttle_config_lock, flags);
+	return 0;
+}
+
+/* Clear all per-uid (per-app) in-flight token entries. */
+int smart_io_throttle_clear_app_tokens(void)
+{
+	unsigned long flags;
+	int i;
+
+	spin_lock_irqsave(&throttle_config_lock, flags);
+	for (i = 0; i < SMART_IO_APP_TOKEN_MAX; i++)
+		app_token_table[i].valid = false;
+	spin_unlock_irqrestore(&throttle_config_lock, flags);
+	return 0;
+}
+
+/* Fill the per-uid token table into the caller's array; returns the entry
+ * count. Used for the proc show. */
+int smart_io_throttle_get_app_tokens(struct smart_io_app_token_entry *out,
+				     int max_entries)
+{
+	unsigned long flags;
+	int i;
+	int n = 0;
+
+	spin_lock_irqsave(&throttle_config_lock, flags);
+	for (i = 0; i < SMART_IO_APP_TOKEN_MAX && n < max_entries; i++) {
+		if (!app_token_table[i].valid)
+			continue;
+		out[n].uid = app_token_table[i].uid;
+		memcpy(out[n].tokens, app_token_table[i].tokens,
+		       sizeof(out[n].tokens));
+		out[n].valid = true;
+		n++;
+	}
+	spin_unlock_irqrestore(&throttle_config_lock, flags);
+	return n;
+}
+
+int smart_io_throttle_set_inflight_floor(bool enabled)
+{
+	atomic_set(&inflight_floor, enabled ? 1 : 0);
+	return 0;
+}
+
+bool smart_io_throttle_get_inflight_floor(void)
+{
+	return atomic_read(&inflight_floor) != 0;
+}
+
 int smart_io_throttle_set_ratios(u32 light_pct, u32 medium_pct,
 				 u32 heavy_pct)
 {
@@ -2982,7 +3248,7 @@ const char *smart_io_action_source_name(enum smart_io_action_source source)
 
 const char *smart_io_gate_reason_name(enum smart_io_gate_reason reason)
 {
-	if (reason > SMART_IO_GATE_DEPTH)
+	if (reason > SMART_IO_GATE_TOKEN)
 		return "invalid";
 	return gate_reason_names[reason];
 }
@@ -3008,6 +3274,10 @@ void smart_io_throttle_get_stats(struct smart_io_throttle_stats *stats)
 	stats->dev_lat_threshold_us = smart_io_throttle_get_dev_lat_threshold();
 	stats->background_deadline_ms =
 		smart_io_throttle_get_background_deadline_ms();
+	smart_io_throttle_get_queue_tokens(&stats->queue_tokens[0],
+					   &stats->queue_tokens[1],
+					   &stats->queue_tokens[2],
+					   &stats->queue_tokens[3]);
 	smart_io_throttle_get_ratios(&light_pct, &medium_pct, &heavy_pct);
 	stats->light_pct = light_pct;
 	stats->medium_pct = medium_pct;
@@ -3029,6 +3299,7 @@ void smart_io_throttle_get_stats(struct smart_io_throttle_stats *stats)
 		stats->target_depth = ctx->action.target_depth;
 		stats->current_depth += ctx->current_depth;
 		stats->bg_current_depth += ctx->bg_current_depth;
+		stats->be_current_depth += ctx->be_current_depth;
 		stats->issued_depth += ctx->issued_depth;
 		stats->meta_capacity += ctx->meta_capacity;
 		stats->meta_inuse += ctx->meta_inuse;
