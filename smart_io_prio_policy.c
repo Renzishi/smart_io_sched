@@ -80,11 +80,11 @@ static bool current_can_mark_vip(u16 ioprio,
 {
 	u16 hint = IOPRIO_PRIO_HINT(ioprio);
 
-	if ((opf & REQ_RAHEAD) && ino != 1 && ino != 2)
-		return false;
-
 	if (hint & (SMART_IO_PGF_IOPRIO_HINT | SMART_IO_PI_IOPRIO_HINT))
 		return true;
+
+	if ((opf & REQ_RAHEAD) && ino != 1 && ino != 2)
+		return false;
 
 	return current_is_ux();
 }
