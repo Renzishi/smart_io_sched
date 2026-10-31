@@ -14,6 +14,7 @@
 #include <linux/init.h>
 #include <linux/compiler.h>
 #include <linux/ktime.h>
+#include <linux/preempt.h>
 #include <linux/rbtree.h>
 #include <linux/sbitmap.h>
 
@@ -42,6 +43,48 @@ static const int prio_aging_expire = 10 * HZ;
 static const int writes_starved = 2;    /* max times reads can starve a write */
 static const int fifo_batch = 16;       /* # of sequential requests treated as one
 				     by the above parameters. For throughput. */
+
+/*
+ * VIP/HP(前台同步读)插入后同步跑一次 hw queue：把 blk-mq 给 elevator 队列安排的
+ * 异步派发(kblockd)变成本任务内的内联派发。默认关闭，便于 A/B。
+ * hp_inline_dispatch 打开时覆盖 VIP 与 HP 两类读请求。
+ */
+static bool vip_inline_dispatch;
+module_param(vip_inline_dispatch, bool, 0644);
+MODULE_PARM_DESC(vip_inline_dispatch,
+		 "Run the hw queue synchronously after inserting a VIP request");
+
+static bool hp_inline_dispatch;
+module_param(hp_inline_dispatch, bool, 0644);
+MODULE_PARM_DESC(hp_inline_dispatch,
+		 "Run the hw queue synchronously after inserting an HP/VIP read request");
+
+/*
+ * 让 insert-merge 命中“前一条插入的请求”：内核 elv_attempt_insert_merge()
+ * 只检查 q->last_merge（通常指向队头）和按起始扇区的哈希，深队列 FIFO 下
+ * 相邻 4K 永远合不上。打开后每次插入前把 q->last_merge 指向前一条。
+ */
+static bool merge_last_insert;
+module_param(merge_last_insert, bool, 0644);
+MODULE_PARM_DESC(merge_last_insert,
+		 "Point q->last_merge at the most recently inserted request to enable back merges");
+
+static bool dd_should_inline_dispatch(const struct request *rq)
+{
+	u16 ioprio;
+
+	if (!vip_inline_dispatch && !hp_inline_dispatch)
+		return false;
+	if (req_op((struct request *)rq) != REQ_OP_READ)
+		return false;
+	ioprio = req_get_ioprio((struct request *)rq);
+	if (vip_inline_dispatch && is_vip_ioprio(ioprio))
+		return true;
+	if (hp_inline_dispatch &&
+	    (is_hp_ioprio(ioprio) || is_vip_ioprio(ioprio)))
+		return true;
+	return false;
+}
 
 enum dd_data_dir {
 	DD_READ		= READ,
@@ -1262,6 +1305,33 @@ static bool dd_bio_merge(struct request_queue *q, struct bio *bio,
 }
 
 /*
+ * 找到同 prio/方向里“尾部正好接上新请求起始扇区”的排队请求（back merge 目标）。
+ * 请求流会和其它文件交错，不能只看“上一次插入”；rbtree 以起始扇区为键，
+ * 这里做前驱查找，再校验尾部是否相接。
+ */
+static struct request *dd_find_back_merge_target(struct dd_per_prio *per_prio,
+						 struct request *rq)
+{
+	struct rb_node *node = per_prio->sort_list[rq_data_dir(rq)].rb_node;
+	struct request *best = NULL;
+
+	while (node) {
+		struct request *cur = rb_entry(node, struct request, rb_node);
+
+		if (blk_rq_pos(cur) < blk_rq_pos(rq)) {
+			best = cur;
+			node = node->rb_right;
+		} else {
+			node = node->rb_left;
+		}
+	}
+
+	if (best && blk_rq_pos(best) + blk_rq_sectors(best) == blk_rq_pos(rq))
+		return best;
+	return NULL;
+}
+
+/*
  * add rq to rbtree and fifo
  */
 static void dd_insert_request(struct blk_mq_hw_ctx *hctx, struct request *rq,
@@ -1289,6 +1359,12 @@ static void dd_insert_request(struct blk_mq_hw_ctx *hctx, struct request *rq,
 		per_prio->stats.inserted++;
 	rq->elv.priv[0] = per_prio;
 
+	if (merge_last_insert) {
+		struct request *prev = dd_find_back_merge_target(per_prio, rq);
+
+		if (prev)
+			q->last_merge = prev;
+	}
 	if (blk_mq_sched_try_insert_merge(q, rq, free))
 		return;
 
@@ -1325,6 +1401,7 @@ static void dd_insert_requests(struct blk_mq_hw_ctx *hctx,
 	struct request_queue *q = hctx->queue;
 	struct deadline_data *dd = q->elevator->elevator_data;
 	LIST_HEAD(free);
+	bool inserted_vip = false;
 
 	spin_lock(&dd->lock);
 	while (!list_empty(list)) {
@@ -1332,11 +1409,21 @@ static void dd_insert_requests(struct blk_mq_hw_ctx *hctx,
 
 		rq = list_first_entry(list, struct request, queuelist);
 		list_del_init(&rq->queuelist);
+		if (dd_should_inline_dispatch(rq))
+			inserted_vip = true;
 		dd_insert_request(hctx, rq, flags, &free);
 	}
 	spin_unlock(&dd->lock);
 
 	blk_mq_free_requests(&free);
+
+	/*
+	 * BLOCKING 队列在派发时会经过 blk_mq_run_dispatch_ops()（取 SRCU，
+	 * 可能睡眠），因此只在可抢占的进程上下文内联执行，其余情况保持
+	 * blk-mq 原有的异步派发。
+	 */
+	if (inserted_vip && in_task() && preemptible())
+		blk_mq_run_hw_queue(hctx, false);
 }
 
 /* Callback from inside blk_mq_rq_ctx_init(). */
