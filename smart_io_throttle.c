@@ -25,6 +25,7 @@
 #include "linux/compiler_attributes.h"
 #include "smart_io_model_fp32.h"
 #include "block_helper.h"
+#include "smart_io_log.h"
 #include "smart_io_rl.h"
 #include "smart_io_throttle.h"
 #include "smart_io_types.h"
@@ -1807,8 +1808,6 @@ free_meta:
 void smart_io_throttle_queue_exit(struct smart_io_throttle_ctx *ctx)
 {
 	unsigned long flags;
-	bool meta_busy;
-	bool active_busy;
 
 	mutex_lock(&active_throttle_queues_lock);
 	spin_lock_irqsave(&ctx->lock, flags);
@@ -1828,17 +1827,45 @@ void smart_io_throttle_queue_exit(struct smart_io_throttle_ctx *ctx)
 	if (ctx->timeout_wq)
 		destroy_workqueue(ctx->timeout_wq);
 
+	/*
+	 * 队列已被 blk-mq 冻结，此处残留只可能来自未配对的 release（请求在调度
+	 * 器队列中被合并/丢弃，或完成路径拿不到 meta）。强制归零并释放 meta 池：
+	 * 否则残留计数会污染下一个 queue 实例，meta 池也会泄漏。
+	 */
 	spin_lock_irqsave(&ctx->lock, flags);
-	WARN_ON_ONCE(ctx->current_depth != 0);
-	WARN_ON_ONCE(ctx->bg_current_depth != 0);
-	WARN_ON_ONCE(ctx->issued_depth != 0);
-	WARN_ON_ONCE(ctx->pending_fg || ctx->pending_bg);
-	WARN_ON_ONCE(ctx->deadline_forced_active);
-	active_busy = WARN_ON_ONCE(!hash_empty(ctx->active));
-	meta_busy = WARN_ON_ONCE(ctx->meta_inuse != 0);
+	if (ctx->current_depth || ctx->bg_current_depth ||
+	    ctx->rt_current_depth || ctx->be_current_depth ||
+	    ctx->issued_depth || ctx->pending_fg || ctx->pending_bg ||
+	    ctx->deadline_forced_active || !hash_empty(ctx->active) ||
+	    ctx->meta_inuse) {
+		smart_io_log_warn(
+			"throttle exit force reset: depth=%u bg=%u rt=%u be=%u issued=%u pending=%u/%u meta=%u active=%d\n",
+			ctx->current_depth, ctx->bg_current_depth,
+			ctx->rt_current_depth, ctx->be_current_depth,
+			ctx->issued_depth, ctx->pending_fg, ctx->pending_bg,
+			ctx->meta_inuse, !hash_empty(ctx->active));
+		ctx->depth_anomalies++;
+		ctx->current_depth = 0;
+		ctx->bg_current_depth = 0;
+		ctx->rt_current_depth = 0;
+		ctx->be_current_depth = 0;
+		ctx->issued_depth = 0;
+		ctx->pending_fg = 0;
+		ctx->pending_bg = 0;
+		ctx->deadline_forced_active = false;
+		ctx->gate_blocked = false;
+		ctx->gate_reason = SMART_IO_GATE_NONE;
+		ctx->throttle_active = false;
+		ctx->inference_pending = false;
+		ctx->action_valid = false;
+		ctx->feedback_meta = NULL;
+		ctx->meta_inuse = 0;
+		hash_init(ctx->active);
+		hash_init(ctx->inflight);
+		hash_init(ctx->inflight_start);
+		INIT_LIST_HEAD(&ctx->free_meta);
+	}
 	spin_unlock_irqrestore(&ctx->lock, flags);
-	if (meta_busy || active_busy)
-		return;
 	kfree(ctx->meta_pool);
 	ctx->meta_pool = NULL;
 }
@@ -2950,6 +2977,7 @@ static void smart_io_throttle_reset_context(struct smart_io_throttle_ctx *ctx,
 					     bool new_session)
 {
 	struct smart_io_rq_meta *meta;
+	struct hlist_node *tmp;
 	unsigned long flags;
 	u64 now_ns = new_session ? ktime_get_boottime_ns() : 0;
 	int bkt;
@@ -2958,12 +2986,35 @@ static void smart_io_throttle_reset_context(struct smart_io_throttle_ctx *ctx,
 	if (new_session)
 		ctx->session_id++;
 	smart_io_throttle_fallback_locked(ctx);
-	hash_for_each(ctx->active, bkt, meta, active_node) {
-		if (new_session && meta->queued &&
-		    meta->class == SMART_IO_RQ_BACKGROUND)
-			meta->queued_ts_ns = now_ns;
-		else
-			meta->queued_ts_ns = 0;
+	if (new_session) {
+		hash_for_each(ctx->active, bkt, meta, active_node) {
+			if (meta->queued &&
+			    meta->class == SMART_IO_RQ_BACKGROUND)
+				meta->queued_ts_ns = now_ns;
+			else
+				meta->queued_ts_ns = 0;
+		}
+	} else {
+		/*
+		 * 关闭 throttle 时结清在途账本：关闭期间的完成会被
+		 * record_complete()/finish_request() 的 enabled 检查直接跳过，
+		 * 若不在此释放，depth/issued/meta 会永久泄漏——低 token 下
+		 * 几次泄漏就能把某一类的门永久占满并导致系统 HANG。
+		 */
+		hash_for_each_safe(ctx->active, bkt, tmp, meta, active_node) {
+			enum smart_io_gate_reason reason = SMART_IO_GATE_NONE;
+
+			smart_io_throttle_release_deadline_locked(ctx, meta);
+			smart_io_throttle_release_issued_depth_locked(
+				ctx, &meta->issued_accounted);
+			smart_io_throttle_release_depth_locked(ctx, meta,
+							       &reason);
+			smart_io_throttle_free_meta_locked(ctx, meta->rq, meta);
+		}
+		ctx->pending_fg = 0;
+		ctx->pending_bg = 0;
+		ctx->gate_blocked = false;
+		ctx->gate_reason = SMART_IO_GATE_NONE;
 	}
 	spin_unlock_irqrestore(&ctx->lock, flags);
 
