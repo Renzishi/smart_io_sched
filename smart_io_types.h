@@ -185,6 +185,7 @@ struct smart_io_event {
 	u64 file_fault_wait_us;
 
 	u8 direct_path;
+	u8 keyio_dt4;
 };
 
 struct smart_io_counters {

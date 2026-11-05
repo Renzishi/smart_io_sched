@@ -14,6 +14,7 @@
 #include "smart_io_log.h"
 #include "smart_io_rl.h"
 #include "system_context.h"
+#include "tp_binder.h"
 #include "tp_filemap.h"
 #include "tp_pi.h"
 #include "trace_instance.h"
@@ -239,6 +240,7 @@ void smart_io_set_fg_uid(uid_t uid)
 	if (uid == atomic_read(&fg_uid))
 		return;
 	atomic_set(&fg_uid, uid);
+	smart_io_binder_pi_clear_all("fg_uid_change");
 	/*
 	 * fg_uid is the reliable foreground-epoch boundary. The main-thread
 	 * identity is fg_uid + pid==tgid, so a new foreground app means a new

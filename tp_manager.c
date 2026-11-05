@@ -1,5 +1,6 @@
 #include <linux/printk.h>
 
+#include "fg_page_protect.h"
 #include "smart_io_log.h"
 #include "tp_binder.h"
 #include "tp_f2fs.h"
@@ -60,18 +61,17 @@ int smart_io_tp_init(void)
 		return ret;
 	}
 
-	// ret = register_binder_tracepoints();
-	// if (ret) {
-	// 	unregister_filemap_tracepoints();
-	// 	unregister_psi_tracepoints();
-	// 	unregister_f2fs_tracepoints();
-	// 	unregister_block_tracepoints();
-	// 	smart_io_log_err("failed to register binder tracepoints: %d\n", ret);
-	// 	return ret;
-	// }
+	ret = register_fg_page_protect();
+	if (ret)
+		smart_io_log_warn("fg_page_protect unavailable: %d\n", ret);
+
+	ret = register_binder_tracepoints();
+	if (ret)
+		smart_io_log_err("binder tracepoints unavailable: %d\n", ret);
 
 	ret = register_sched_tracepoints();
 	if (ret) {
+		unregister_fg_page_protect();
 		unregister_pagecache_demo();
 		unregister_filemap_fault_tracepoints();
 		unregister_psi_tracepoints();
@@ -89,7 +89,8 @@ void smart_io_tp_exit(void)
 {
 	unregister_pi_tracepoints();
 	unregister_sched_tracepoints();
-	// unregister_binder_tracepoints();
+	unregister_binder_tracepoints();
+	unregister_fg_page_protect();
 	unregister_pagecache_demo();
 	unregister_filemap_fault_tracepoints();
 	unregister_psi_tracepoints();

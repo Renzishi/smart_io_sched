@@ -1,12 +1,9 @@
 #include <linux/atomic.h>
 #include <linux/cred.h>
-#include <linux/hash.h>
-#include <linux/hashtable.h>
 #include <linux/kernel.h>
 #include <linux/ktime.h>
 #include <linux/sched.h>
 #include <linux/sched/task.h>
-#include <linux/slab.h>
 #include <linux/spinlock.h>
 #include <linux/string.h>
 #include <linux/tracepoint.h>
@@ -17,43 +14,27 @@
 
 #include "smart_io_log.h"
 #include "system_context.h"
+#include "tp_binder.h"
 #include "trace_instance.h"
 
-#define BINDER_PENDING_HASH_BITS 8
-#define BINDER_ACTIVE_HASH_BITS 8
+#define BINDER_PI_SLOTS 8
+#define BINDER_PI_MAX_DEPTH 3
+#define BINDER_PI_TTL_NS (100ULL * NSEC_PER_MSEC)
 
 extern atomic_t smart_io_enabled;
 extern atomic_t rawdata_trace_enabled;
 
 struct binder_transaction;
 
-struct binder_pending_txn {
-	struct hlist_node node;
-	struct binder_transaction *txn;
-	struct task_struct *caller_task;
-	u32 caller_uid;
+struct binder_pi_entry {
+	pid_t pid;
+	u8 depth;
+	u64 expire_ns;
 };
 
-struct binder_active_txn {
-	struct hlist_node node;
-	struct task_struct *caller_proc_task;
-	struct task_struct *target_proc_task;
-	struct task_struct *caller_thread_task;
-	struct task_struct *target_thread_task;
-	u32 caller_uid;
-	u32 target_uid;
-	pid_t caller_pid;
-	pid_t caller_tid;
-	pid_t target_pid;
-	pid_t target_tid;
-	int node_debug_id;
-	u64 start_ts_ns;
-};
-
-static DEFINE_HASHTABLE(binder_pending_hash, BINDER_PENDING_HASH_BITS);
-static DEFINE_HASHTABLE(binder_active_hash, BINDER_ACTIVE_HASH_BITS);
-static DEFINE_SPINLOCK(binder_pending_lock);
-static DEFINE_SPINLOCK(binder_active_lock);
+static struct binder_pi_entry binder_pi_slots[BINDER_PI_SLOTS];
+static DEFINE_SPINLOCK(binder_pi_lock);
+static atomic_t binder_pi_active = ATOMIC_INIT(0);
 
 struct tracepoints_table {
 	const char *name;
@@ -61,11 +42,6 @@ struct tracepoints_table {
 	struct tracepoint *tp;
 	bool init;
 };
-
-static inline struct task_struct *proc_task_of(struct task_struct *task)
-{
-	return task ? task->group_leader : NULL;
-}
 
 static inline u32 task_uid_nr_safe(const struct task_struct *task)
 {
@@ -75,174 +51,194 @@ static inline u32 task_uid_nr_safe(const struct task_struct *task)
 	return from_kuid(&init_user_ns, task_uid(task));
 }
 
-static inline unsigned long binder_pending_hash_key(const struct binder_transaction *txn)
+static bool task_is_fg_main(struct task_struct *task)
 {
-	return (unsigned long)txn;
+	int fg_uid = smart_io_get_fg_uid();
+
+	if (!task || fg_uid < 0)
+		return false;
+
+	return task_uid_nr_safe(task) == (u32)fg_uid &&
+	       task->pid == task->tgid;
 }
 
-static inline unsigned long binder_active_hash_key(struct task_struct *caller_proc_task,
-						      struct task_struct *target_proc_task)
-{
-	return ((unsigned long)caller_proc_task >> 4) ^
-	       ((unsigned long)target_proc_task >> 4);
-}
-
-static inline bool binder_raw_trace_enabled(void)
+static bool binder_pi_raw_enabled(void)
 {
 	return atomic_read(&smart_io_enabled) != 0 &&
 	       atomic_read(&rawdata_trace_enabled) != 0;
 }
 
-static void binder_pending_release(struct binder_pending_txn *pending)
+static void binder_pi_purge_locked(u64 now)
 {
-	if (!pending)
+	int i;
+
+	for (i = 0; i < BINDER_PI_SLOTS; i++) {
+		struct binder_pi_entry *entry = &binder_pi_slots[i];
+
+		if (!entry->pid || entry->expire_ns > now)
+			continue;
+
+		entry->pid = 0;
+		entry->depth = 0;
+		entry->expire_ns = 0;
+		atomic_dec(&binder_pi_active);
+	}
+}
+
+static void binder_pi_mark(pid_t pid, const char *comm, u8 depth, u64 now)
+{
+	struct binder_pi_entry *entry;
+	unsigned long flags;
+	u64 expire_ns;
+	u8 logged_depth;
+	int free_idx = -1;
+	int i;
+
+	if (!pid || depth == 0 || depth > BINDER_PI_MAX_DEPTH)
 		return;
 
-	if (pending->caller_task)
-		put_task_struct(pending->caller_task);
-	kfree(pending);
+	expire_ns = now + BINDER_PI_TTL_NS;
+
+	spin_lock_irqsave(&binder_pi_lock, flags);
+	binder_pi_purge_locked(now);
+
+	for (i = 0; i < BINDER_PI_SLOTS; i++) {
+		entry = &binder_pi_slots[i];
+		if (entry->pid == pid) {
+			if (depth < entry->depth)
+				entry->depth = depth;
+			entry->expire_ns = expire_ns;
+			logged_depth = entry->depth;
+			spin_unlock_irqrestore(&binder_pi_lock, flags);
+
+			if (binder_pi_raw_enabled())
+				smart_io_raw_emit("binder_pi_mark: ts=%llu pid=%d comm=%s depth=%u refresh=1\n",
+						  now, pid, comm, logged_depth);
+			return;
+		}
+		if (!entry->pid && free_idx < 0)
+			free_idx = i;
+	}
+
+	if (free_idx < 0) {
+		spin_unlock_irqrestore(&binder_pi_lock, flags);
+		return;
+	}
+
+	entry = &binder_pi_slots[free_idx];
+	entry->pid = pid;
+	entry->depth = depth;
+	entry->expire_ns = expire_ns;
+	atomic_inc(&binder_pi_active);
+	spin_unlock_irqrestore(&binder_pi_lock, flags);
+
+	if (binder_pi_raw_enabled())
+		smart_io_raw_emit("binder_pi_mark: ts=%llu pid=%d comm=%s depth=%u expire_ns=%llu\n",
+				  now, pid, comm, depth, expire_ns);
 }
 
-static void binder_active_release(struct binder_active_txn *active)
+static u8 binder_pi_depth_at(pid_t pid, u64 now)
 {
-	if (!active)
+	unsigned long flags;
+	u8 depth = 0;
+	int i;
+
+	if (!pid || atomic_read(&binder_pi_active) == 0)
+		return 0;
+
+	spin_lock_irqsave(&binder_pi_lock, flags);
+	binder_pi_purge_locked(now);
+
+	for (i = 0; i < BINDER_PI_SLOTS; i++) {
+		if (binder_pi_slots[i].pid == pid) {
+			depth = binder_pi_slots[i].depth;
+			break;
+		}
+	}
+	spin_unlock_irqrestore(&binder_pi_lock, flags);
+
+	return depth;
+}
+
+static void binder_pi_clear_pid(pid_t pid, const char *comm,
+				const char *reason)
+{
+	struct binder_pi_entry *entry;
+	unsigned long flags;
+	int i;
+
+	if (!pid || atomic_read(&binder_pi_active) == 0)
 		return;
 
-	if (active->target_thread_task)
-		put_task_struct(active->target_thread_task);
-	if (active->caller_thread_task)
-		put_task_struct(active->caller_thread_task);
-	if (active->target_proc_task)
-		put_task_struct(active->target_proc_task);
-	if (active->caller_proc_task)
-		put_task_struct(active->caller_proc_task);
-	kfree(active);
-}
-
-static struct binder_pending_txn *binder_pending_take(struct binder_transaction *txn)
-{
-	struct binder_pending_txn *pending;
-	struct binder_pending_txn *found = NULL;
-	unsigned long flags;
-
-	spin_lock_irqsave(&binder_pending_lock, flags);
-	hash_for_each_possible(binder_pending_hash, pending, node,
-			       binder_pending_hash_key(txn)) {
-		if (pending->txn != txn)
+	spin_lock_irqsave(&binder_pi_lock, flags);
+	for (i = 0; i < BINDER_PI_SLOTS; i++) {
+		entry = &binder_pi_slots[i];
+		if (entry->pid != pid)
 			continue;
-		hash_del(&pending->node);
-		found = pending;
-		break;
-	}
-	spin_unlock_irqrestore(&binder_pending_lock, flags);
 
-	return found;
+		entry->pid = 0;
+		entry->depth = 0;
+		entry->expire_ns = 0;
+		atomic_dec(&binder_pi_active);
+		spin_unlock_irqrestore(&binder_pi_lock, flags);
+
+		if (binder_pi_raw_enabled())
+			smart_io_raw_emit("binder_pi_clear: ts=%llu pid=%d comm=%s reason=%s\n",
+					  ktime_get_boottime_ns(), pid, comm, reason);
+		return;
+	}
+	spin_unlock_irqrestore(&binder_pi_lock, flags);
 }
 
-static void binder_pending_add(struct binder_transaction *txn,
-			       struct task_struct *caller_task, u32 caller_uid)
+bool smart_io_binder_pi_current_marked(void)
 {
-	struct binder_pending_txn *pending;
-	struct binder_pending_txn *entry;
-	struct binder_pending_txn *stale = NULL;
-	unsigned long flags;
+	return binder_pi_depth_at(current->pid,
+				  ktime_get_boottime_ns()) != 0;
+}
 
-	pending = kzalloc(sizeof(*pending), GFP_ATOMIC);
-	if (!pending)
+void smart_io_binder_pi_clear_all(const char *reason)
+{
+	unsigned long flags;
+	int active;
+	int i;
+
+	spin_lock_irqsave(&binder_pi_lock, flags);
+	for (i = 0; i < BINDER_PI_SLOTS; i++) {
+		binder_pi_slots[i].pid = 0;
+		binder_pi_slots[i].depth = 0;
+		binder_pi_slots[i].expire_ns = 0;
+	}
+	active = atomic_xchg(&binder_pi_active, 0);
+	spin_unlock_irqrestore(&binder_pi_lock, flags);
+
+	if (active && binder_pi_raw_enabled())
+		smart_io_raw_emit("binder_pi_clear_all: ts=%llu active=%d reason=%s\n",
+				  ktime_get_boottime_ns(), active, reason);
+}
+
+static void tp_sync_txn_recvd_cb(void *ignore, struct task_struct *tsk,
+				 struct task_struct *from)
+{
+	u64 now;
+	u8 depth;
+
+	(void)ignore;
+
+	if (!tsk || !from || tsk == from)
+		return;
+	if (atomic_read(&smart_io_enabled) == 0)
 		return;
 
-	get_task_struct(caller_task);
-	pending->txn = txn;
-	pending->caller_task = caller_task;
-	pending->caller_uid = caller_uid;
+	now = ktime_get_boottime_ns();
 
-	spin_lock_irqsave(&binder_pending_lock, flags);
-	hash_for_each_possible(binder_pending_hash, entry, node,
-			       binder_pending_hash_key(txn)) {
-		if (entry->txn != txn)
-			continue;
-		hash_del(&entry->node);
-		stale = entry;
-		break;
-	}
-	hash_add(binder_pending_hash, &pending->node, binder_pending_hash_key(txn));
-	spin_unlock_irqrestore(&binder_pending_lock, flags);
-
-	binder_pending_release(stale);
-}
-
-static void binder_active_add(struct binder_active_txn *active)
-{
-	struct binder_active_txn *entry;
-	struct binder_active_txn *stale = NULL;
-	unsigned long flags;
-	unsigned long key;
-
-	key = binder_active_hash_key(active->caller_proc_task, active->target_proc_task);
-
-	spin_lock_irqsave(&binder_active_lock, flags);
-	hash_for_each_possible(binder_active_hash, entry, node, key) {
-		if (entry->caller_proc_task != active->caller_proc_task ||
-		    entry->target_proc_task != active->target_proc_task ||
-		    entry->caller_thread_task != active->caller_thread_task)
-			continue;
-		hash_del(&entry->node);
-		stale = entry;
-		break;
-	}
-	hash_add(binder_active_hash, &active->node, key);
-	spin_unlock_irqrestore(&binder_active_lock, flags);
-
-	binder_active_release(stale);
-}
-
-static struct binder_active_txn *binder_active_take(struct task_struct *caller_proc_task,
-						    struct task_struct *target_proc_task,
-						    struct task_struct *caller_thread_task,
-						    struct task_struct *target_thread_task)
-{
-	struct binder_active_txn *entry;
-	struct binder_active_txn *found = NULL;
-	unsigned long flags;
-	unsigned long key;
-
-	key = binder_active_hash_key(caller_proc_task, target_proc_task);
-
-	spin_lock_irqsave(&binder_active_lock, flags);
-	hash_for_each_possible(binder_active_hash, entry, node, key) {
-		if (entry->caller_proc_task != caller_proc_task ||
-		    entry->target_proc_task != target_proc_task ||
-		    entry->caller_thread_task != caller_thread_task)
-			continue;
-		if (entry->target_thread_task &&
-		    target_thread_task &&
-		    entry->target_thread_task != target_thread_task)
-			continue;
-		hash_del(&entry->node);
-		found = entry;
-		break;
-	}
-	spin_unlock_irqrestore(&binder_active_lock, flags);
-
-	return found;
-}
-
-static void cleanup_binder_state(void)
-{
-	struct binder_pending_txn *pending;
-	struct binder_active_txn *active;
-	struct hlist_node *tmp;
-	int bucket;
-
-	hash_for_each_safe(binder_pending_hash, bucket, tmp, pending, node) {
-		hash_del(&pending->node);
-		binder_pending_release(pending);
+	if (task_is_fg_main(from)) {
+		binder_pi_mark(tsk->pid, tsk->comm, 1, now);
+		return;
 	}
 
-	hash_for_each_safe(binder_active_hash, bucket, tmp, active, node) {
-		hash_del(&active->node);
-		binder_active_release(active);
-	}
+	depth = binder_pi_depth_at(from->pid, now);
+	if (depth && depth < BINDER_PI_MAX_DEPTH)
+		binder_pi_mark(tsk->pid, tsk->comm, depth + 1, now);
 }
 
 static void tp_binder_transaction_record_cb(void *ignore,
@@ -250,154 +246,23 @@ static void tp_binder_transaction_record_cb(void *ignore,
 					    struct binder_transaction *t,
 					    struct binder_transaction *in_reply_to)
 {
-	struct task_struct *caller_task = current;
-	uid_t fg_uid;
-	u32 caller_uid;
-
 	(void)ignore;
+	(void)tr;
+	(void)t;
 
-	if (!tr || !t || in_reply_to)
+	if (!in_reply_to)
 		return;
-	if (tr->flags & TF_ONE_WAY)
-		return;
-	if (!binder_raw_trace_enabled())
-		return;
-
-	fg_uid = (uid_t)smart_io_get_fg_uid();
-	if ((int)fg_uid < 0)
+	if (atomic_read(&binder_pi_active) == 0)
 		return;
 
-	caller_uid = task_uid_nr_safe(caller_task);
-	if (caller_uid != fg_uid)
-		return;
-
-	binder_pending_add(t, caller_task, caller_uid);
-}
-
-static void tp_binder_proc_transaction_cb(void *ignore,
-					  struct task_struct *caller_task,
-					  struct task_struct *binder_proc_task,
-					  struct task_struct *binder_th_task,
-					  int node_debug_id,
-					  struct binder_transaction *t,
-					  bool pending_async)
-{
-	struct binder_pending_txn *pending;
-	struct binder_active_txn *active;
-	struct task_struct *caller_proc_task;
-	u64 now;
-
-	(void)ignore;
-
-	if (!caller_task || !binder_proc_task || !t || pending_async)
-		return;
-
-	pending = binder_pending_take(t);
-	if (!pending)
-		return;
-
-	if (!binder_raw_trace_enabled()) {
-		binder_pending_release(pending);
-		return;
-	}
-
-	if (pending->caller_task != caller_task) {
-		binder_pending_release(pending);
-		return;
-	}
-
-	caller_proc_task = proc_task_of(caller_task);
-	if (!caller_proc_task) {
-		binder_pending_release(pending);
-		return;
-	}
-
-	active = kzalloc(sizeof(*active), GFP_ATOMIC);
-	if (!active) {
-		binder_pending_release(pending);
-		return;
-	}
-
-	get_task_struct(caller_proc_task);
-	get_task_struct(binder_proc_task);
-	get_task_struct(caller_task);
-	if (binder_th_task)
-		get_task_struct(binder_th_task);
-
-	now = ktime_get_boottime_ns();
-	active->caller_proc_task = caller_proc_task;
-	active->target_proc_task = binder_proc_task;
-	active->caller_thread_task = caller_task;
-	active->target_thread_task = binder_th_task;
-	active->caller_uid = pending->caller_uid;
-	active->target_uid = task_uid_nr_safe(binder_proc_task);
-	active->caller_pid = task_tgid_nr(caller_task);
-	active->caller_tid = task_pid_nr(caller_task);
-	active->target_pid = task_tgid_nr(binder_proc_task);
-	active->target_tid = binder_th_task ? task_pid_nr(binder_th_task) : 0;
-	active->node_debug_id = node_debug_id;
-	active->start_ts_ns = now;
-
-	binder_active_add(active);
-	binder_pending_release(pending);
-
-	smart_io_raw_emit(
-		"binder_sync_wait_begin: ts=%llu caller_uid=%u caller_pid=%d caller_tid=%d "
-		"target_uid=%u target_pid=%d target_tid=%d node_debug_id=%d sync=1\n",
-		now, active->caller_uid, active->caller_pid, active->caller_tid,
-		active->target_uid, active->target_pid, active->target_tid,
-		active->node_debug_id);
-}
-
-static void tp_sync_txn_recvd_cb(void *ignore, struct task_struct *tsk,
-				 struct task_struct *from)
-{
-	struct task_struct *caller_proc_task;
-	struct task_struct *target_proc_task;
-	struct binder_active_txn *active;
-	u64 now;
-	u64 dur_us;
-
-	(void)ignore;
-
-	if (!tsk || !from)
-		return;
-
-	caller_proc_task = proc_task_of(tsk);
-	target_proc_task = proc_task_of(from);
-	if (!caller_proc_task || !target_proc_task)
-		return;
-
-	active = binder_active_take(caller_proc_task, target_proc_task, tsk, from);
-	if (!active)
-		return;
-
-	if (!binder_raw_trace_enabled()) {
-		binder_active_release(active);
-		return;
-	}
-
-	now = ktime_get_boottime_ns();
-	dur_us = div_u64(now - active->start_ts_ns, NSEC_PER_USEC);
-
-	smart_io_raw_emit(
-		"binder_sync_wait_end: ts=%llu dur_us=%llu caller_uid=%u caller_pid=%d caller_tid=%d "
-		"target_uid=%u target_pid=%d target_tid=%d node_debug_id=%d sync=1\n",
-		now, dur_us, active->caller_uid, active->caller_pid,
-		active->caller_tid, task_uid_nr_safe(target_proc_task),
-		task_tgid_nr(target_proc_task), task_pid_nr(from),
-		active->node_debug_id);
-
-	binder_active_release(active);
+	binder_pi_clear_pid(current->pid, current->comm, "reply");
 }
 
 static struct tracepoints_table interests[] = {
-	{ .name = "android_vh_binder_transaction_record",
-	  .func = tp_binder_transaction_record_cb },
-	{ .name = "android_vh_binder_proc_transaction",
-	  .func = tp_binder_proc_transaction_cb },
 	{ .name = "android_vh_sync_txn_recvd",
 	  .func = tp_sync_txn_recvd_cb },
+	{ .name = "android_vh_binder_transaction_record",
+	  .func = tp_binder_transaction_record_cb },
 };
 
 #define FOR_EACH_INTEREST(i) \
@@ -428,7 +293,7 @@ void unregister_binder_tracepoints(void)
 	}
 
 	tracepoint_synchronize_unregister();
-	cleanup_binder_state();
+	smart_io_binder_pi_clear_all("unregister");
 	smart_io_log_info("binder tracepoints unregistered.\n");
 }
 
@@ -437,9 +302,7 @@ int register_binder_tracepoints(void)
 	int i;
 	int ret;
 
-	cleanup_binder_state();
-	hash_init(binder_pending_hash);
-	hash_init(binder_active_hash);
+	smart_io_binder_pi_clear_all("register");
 	for_each_kernel_tracepoint(lookup_tracepoints, NULL);
 
 	FOR_EACH_INTEREST(i) {

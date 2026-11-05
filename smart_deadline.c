@@ -17,8 +17,12 @@
 #include <linux/preempt.h>
 #include <linux/rbtree.h>
 #include <linux/sbitmap.h>
+#include <linux/cpumask.h>
+#include <linux/workqueue.h>
+#include <linux/tracepoint.h>
 
 #include <trace/events/block.h>
+#include <trace/hooks/blk.h>
 
 #include <block/elevator.h>
 #include <block/blk.h>
@@ -49,6 +53,7 @@ static const int fifo_batch = 16;       /* # of sequential requests treated as o
  * 异步派发(kblockd)变成本任务内的内联派发。默认关闭，便于 A/B。
  * hp_inline_dispatch 打开时覆盖 VIP 与 HP 两类读请求。
  */
+// static bool vip_inline_dispatch = true;
 static bool vip_inline_dispatch;
 module_param(vip_inline_dispatch, bool, 0644);
 MODULE_PARM_DESC(vip_inline_dispatch,
@@ -84,6 +89,57 @@ static bool dd_should_inline_dispatch(const struct request *rq)
 	    (is_hp_ioprio(ioprio) || is_vip_ioprio(ioprio)))
 		return true;
 	return false;
+}
+
+/*
+ * dispatch_mode:
+ *   0 = off，沿用 blk-mq 默认的异步派发（kblockd）
+ *   非 0 = 把本 elevator 的延迟派发（hctx->run_work）改挂到自己的高优先
+ *          workqueue 上执行；不新建 work，保留 core 传入的 delay。
+ *          参考 OnePlus wq_dynamic_priority 的 android_vh_blk_mq_delay_run_hw_queue。
+ */
+static int dispatch_mode;
+module_param(dispatch_mode, int, 0644);
+MODULE_PARM_DESC(dispatch_mode,
+		 "0=off, non-zero=hijack hctx run_work onto smart_io_disp wq");
+
+static struct workqueue_struct *dd_dispatch_wq;
+static bool dd_hook_registered;
+
+/* 只作 hctx 归属标记（不分配内存），hctx->sched_data 由 elevator 拥有。 */
+static int dd_hctx_marker;
+
+static bool dd_hctx_is_ours(struct blk_mq_hw_ctx *hctx)
+{
+	return hctx && hctx->sched_data == &dd_hctx_marker;
+}
+
+/*
+ * blk-mq 只有在内核可抢占、且当前 CPU 属于 hctx->cpumask 时才会真正内联派发；
+ * 否则 blk_mq_run_hw_queue(..., false) 也会回落到 kblockd。
+ */
+static bool dd_can_inline_dispatch(struct blk_mq_hw_ctx *hctx)
+{
+	if (!in_task() || !preemptible() || !hctx)
+		return false;
+	return cpumask_test_cpu(raw_smp_processor_id(), hctx->cpumask);
+}
+
+/*
+ * 核心准备把 hctx 的派发交给 kblockd 时先经过这里：把内核自己的
+ * hctx->run_work 改挂到 smart_io_disp，并保留原来的 delay。
+ * 不新建 work，pending/去重语义仍由 core 维护；非本 elevator 的队列不动。
+ */
+static void dd_delay_run_hw_queue_hook(void *data, int cpu,
+				       struct blk_mq_hw_ctx *hctx,
+				       unsigned long delay, bool *skip)
+{
+	if (!dispatch_mode || !dd_dispatch_wq || !skip)
+		return;
+	if (!dd_hctx_is_ours(hctx))
+		return;
+	mod_delayed_work_on(cpu, dd_dispatch_wq, &hctx->run_work, delay);
+	*skip = true;
 }
 
 enum dd_data_dir {
@@ -1164,8 +1220,16 @@ static void dd_depth_updated(struct blk_mq_hw_ctx *hctx)
 /* Called by blk_mq_init_hctx() and blk_mq_init_sched(). */
 static int dd_init_hctx(struct blk_mq_hw_ctx *hctx, unsigned int hctx_idx)
 {
+	hctx->sched_data = &dd_hctx_marker;
+
 	dd_depth_updated(hctx);
 	return 0;
+}
+
+static void dd_exit_hctx(struct blk_mq_hw_ctx *hctx, unsigned int hctx_idx)
+{
+	if (hctx->sched_data == &dd_hctx_marker)
+		hctx->sched_data = NULL;
 }
 
 static void dd_exit_sched(struct elevator_queue *e)
@@ -1401,7 +1465,7 @@ static void dd_insert_requests(struct blk_mq_hw_ctx *hctx,
 	struct request_queue *q = hctx->queue;
 	struct deadline_data *dd = q->elevator->elevator_data;
 	LIST_HEAD(free);
-	bool inserted_vip = false;
+	bool inserted_inline = false;
 
 	spin_lock(&dd->lock);
 	while (!list_empty(list)) {
@@ -1410,7 +1474,7 @@ static void dd_insert_requests(struct blk_mq_hw_ctx *hctx,
 		rq = list_first_entry(list, struct request, queuelist);
 		list_del_init(&rq->queuelist);
 		if (dd_should_inline_dispatch(rq))
-			inserted_vip = true;
+			inserted_inline = true;
 		dd_insert_request(hctx, rq, flags, &free);
 	}
 	spin_unlock(&dd->lock);
@@ -1418,11 +1482,12 @@ static void dd_insert_requests(struct blk_mq_hw_ctx *hctx,
 	blk_mq_free_requests(&free);
 
 	/*
-	 * BLOCKING 队列在派发时会经过 blk_mq_run_dispatch_ops()（取 SRCU，
-	 * 可能睡眠），因此只在可抢占的进程上下文内联执行，其余情况保持
-	 * blk-mq 原有的异步派发。
+	 * BLOCKING 队列派发会取 SRCU（可能睡眠），只能在内核可抢占的进程上下文里
+	 * 同步执行；且只有当前 CPU 属于 hctx->cpumask 时 blk-mq 才真正内联派发。
+	 * 否则保持 blk-mq 原有的异步派发（dispatch_mode 打开时由 vendor hook 改挂
+	 * 到 smart_io_disp 上执行）。
 	 */
-	if (inserted_vip && in_task() && preemptible())
+	if (inserted_inline && dd_can_inline_dispatch(hctx))
 		blk_mq_run_hw_queue(hctx, false);
 }
 
@@ -1565,6 +1630,7 @@ static struct elevator_type smart_deadline_elevator = {
 		.init_sched		= dd_init_sched,
 		.exit_sched		= dd_exit_sched,
 		.init_hctx		= dd_init_hctx,
+		.exit_hctx		= dd_exit_hctx,
 	},
 
 	.elevator_attrs = deadline_attrs,
@@ -1597,11 +1663,48 @@ bool smart_deadline_rq_is_foreground(const struct request *rq)
 
 int smart_deadline_init(void)
 {
-	return elv_register(&smart_deadline_elevator);
+	int ret;
+
+	dd_dispatch_wq = alloc_workqueue("smart_io_disp",
+					 WQ_MEM_RECLAIM | WQ_HIGHPRI, 0);
+	if (!dd_dispatch_wq)
+		return -ENOMEM;
+
+	ret = register_trace_android_vh_blk_mq_delay_run_hw_queue(
+		dd_delay_run_hw_queue_hook, NULL);
+	if (ret) {
+		pr_warn("smart_io_sched: register delay-run hook failed: %d\n", ret);
+	} else {
+		dd_hook_registered = true;
+	}
+
+	ret = elv_register(&smart_deadline_elevator);
+	if (ret) {
+		if (dd_hook_registered) {
+			unregister_trace_android_vh_blk_mq_delay_run_hw_queue(
+				dd_delay_run_hw_queue_hook, NULL);
+			tracepoint_synchronize_unregister();
+			dd_hook_registered = false;
+		}
+		destroy_workqueue(dd_dispatch_wq);
+		dd_dispatch_wq = NULL;
+	}
+	return ret;
 }
 
 void smart_deadline_exit(void)
 {
 	elv_unregister(&smart_deadline_elevator);
+
+	if (dd_hook_registered) {
+		unregister_trace_android_vh_blk_mq_delay_run_hw_queue(
+			dd_delay_run_hw_queue_hook, NULL);
+		tracepoint_synchronize_unregister();
+		dd_hook_registered = false;
+	}
+	if (dd_dispatch_wq) {
+		destroy_workqueue(dd_dispatch_wq);
+		dd_dispatch_wq = NULL;
+	}
 	smart_io_throttle_model_thread_exit();
 }

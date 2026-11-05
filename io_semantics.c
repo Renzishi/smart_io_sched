@@ -24,14 +24,21 @@
 
 #include "block_helper.h"
 #include "io_semantics.h"
+#include "keyio_dt_4.h"
 #include "smart_io_rl.h"
 #include "smart_io_log.h"
 #include "smart_io_policy.h"
+#include "smart_io_prio_policy.h"
 #include "system_context.h"
 #include "smart_io_throttle.h"
 #include "trace_instance.h"
 #include "tp_pagecache_demo.h"
 #include "tool.h"
+
+static bool keyio_dt4_on;
+module_param(keyio_dt4_on, bool, 0644);
+MODULE_PARM_DESC(keyio_dt4_on,
+		 "Evaluate the depth-4 keyio decision tree on sdc insert (default off)");
 
 #define NR_RQ_SHARDS 8
 #define RQ_HASH_BITS 12
@@ -809,6 +816,28 @@ static void fill_record_from_current(struct rq_record *rec, struct request *rq,
 		evt->tag_max = rl_device.tag_max;
 		evt->r_lat_us = rl_device.r_lat_us;
 		evt->w_lat_us = rl_device.w_lat_us;
+	}
+
+	/* keyio_dt4: depth-4 distilled critical-IO decision tree at the
+	 * DNN's F1-max operating point. sdc only, to keep loop-merged
+	 * requests out of the backend-device decision. Default off.
+	 * VIP requests are skipped; a keyio verdict marks the request
+	 * with the VIP+PI hints. */
+	if (keyio_dt4_on && !strcmp(evt->dev_name, "sdc")) {
+		u8 keyio = 0;
+
+		if (!is_vip_request(rq)) {
+			keyio = keyio_dt4_predict(evt->runqueue_len,
+						  smart_io_rl_main_in_s() ? 1 : 0,
+						  evt->ioprio, comm,
+						  evt->file_ext, fg_uid,
+						  smp_processor_id());
+			if (keyio) {
+				mark_request_vip_pi(rq);
+				evt->ioprio = req_get_ioprio(rq);
+			}
+		}
+		evt->keyio_dt4 = keyio;
 	}
 
 	if (raw_mode_enabled())

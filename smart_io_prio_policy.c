@@ -6,9 +6,21 @@
 #include "smart_io_rl.h"
 #include "linux/blk_types.h"
 #include "system_context.h"
+#include "tp_binder.h"
 #include "tp_pi.h"
 #include "tp_filemap.h"
 #include "tool.h"
+
+/*
+ * top-app 进程的所有 bio 默认提升为 IOPRIO_CLASS_RT（mark_bio_rt），且
+ * set_private_hint() 会把 IOPRIO_CLASS_NONE 转成 BE。关掉后 class/level 完全
+ * 保持原值、只写 hint 位，用于采集"无 class 优先级"的基线：
+ * mq-deadline 只认 class，hint 位不影响它的排序。
+ */
+static bool fg_rt_mark = true;
+module_param(fg_rt_mark, bool, 0644);
+MODULE_PARM_DESC(fg_rt_mark,
+		 "Keep original ioprio class when off (no RT promotion, no NONE->BE)");
 
 bool is_hp_ioprio(u16 ioprio)
 {
@@ -49,7 +61,7 @@ static u16 set_private_hint(u16 ioprio, u16 hint)
 
 	if (ioprio_class > IOPRIO_CLASS_IDLE)
 		return ioprio;
-	if (ioprio_class == IOPRIO_CLASS_NONE) {
+	if (ioprio_class == IOPRIO_CLASS_NONE && fg_rt_mark) {
 		ioprio_class = IOPRIO_CLASS_BE;
 		ioprio = IOPRIO_PRIO_VALUE(IOPRIO_CLASS_BE, IOPRIO_BE_NORM);
 	}
@@ -86,11 +98,14 @@ static bool current_can_mark_vip(u16 ioprio,
 	if ((opf & REQ_RAHEAD) && ino != 1 && ino != 2)
 		return false;
 
-	return current_is_ux();
+	return current_uid_is_fg(); // fg vid policy
+	// return current_is_ux();
 }
 
 void mark_bio_rt(struct bio *bio)
 {
+	if (!fg_rt_mark)
+		return;
 	if (smart_io_rl_cpu_cgroup_class() != SMART_IO_RL_CGROUP_TOP_APP)
 		return;
 
@@ -125,11 +140,24 @@ void mark_bio_pgf(struct bio *bio)
 		SMART_IO_PGF_IOPRIO_HINT);
 }
 
+void mark_request_vip_pi(struct request *rq)
+{
+	u16 ioprio;
+
+	if (!rq)
+		return;
+	ioprio = req_get_ioprio(rq);
+	ioprio = set_private_hint(ioprio,
+			SMART_IO_VIP_IOPRIO_HINT | SMART_IO_PI_IOPRIO_HINT);
+	rq->ioprio = ioprio;
+}
+
 void mark_bio_pi(struct bio *bio)
 {
 	u16 hint = 0;
 
-	if (smart_io_pi_current_marked())
+	if (smart_io_pi_current_marked() ||
+	    smart_io_binder_pi_current_marked())
 		hint |= SMART_IO_HP_IOPRIO_HINT |
 			SMART_IO_PI_IOPRIO_HINT | SMART_IO_VIP_IOPRIO_HINT;
 
