@@ -49,12 +49,20 @@ static const int fifo_batch = 16;       /* # of sequential requests treated as o
 				     by the above parameters. For throughput. */
 
 /*
+ * Scheduler-tag admission ladder (nested prefixes, see dd_limit_depth()):
+ * background reads get bg_read_tag_quota tags, writes get dd->async_depth, and
+ * bios stamped exempt at bio-queue time ride the whole pool. Writes get the
+ * wider window so that a flood of background reads can never push writes into a
+ * tag wait - gating writes is what blew up main-thread D in the bg_hold_ms=8
+ * smoke run. Both tiers default to off (0 / nr_requests).
+ */
+
+/*
  * VIP/HP(前台同步读)插入后同步跑一次 hw queue：把 blk-mq 给 elevator 队列安排的
- * 异步派发(kblockd)变成本任务内的内联派发。默认关闭，便于 A/B。
+ * 异步派发(kblockd)变成本任务内的内联派发。VIP 默认开启。
  * hp_inline_dispatch 打开时覆盖 VIP 与 HP 两类读请求。
  */
-// static bool vip_inline_dispatch = true;
-static bool vip_inline_dispatch;
+static bool vip_inline_dispatch = true;
 module_param(vip_inline_dispatch, bool, 0644);
 MODULE_PARM_DESC(vip_inline_dispatch,
 		 "Run the hw queue synchronously after inserting a VIP request");
@@ -73,6 +81,30 @@ static bool merge_last_insert;
 module_param(merge_last_insert, bool, 0644);
 MODULE_PARM_DESC(merge_last_insert,
 		 "Point q->last_merge at the most recently inserted request to enable back merges");
+
+/*
+ * 后台时间整形：RT(后台读)队头不足 bg_hold_ms 就不派发，够老立即放行，所以 hold
+ * 有界、后台一直有流量，只是被错峰成一段一段，不再靠突发把设备占满。0 = 关闭。
+ * BE(写)不受此门控：限住写会饿死写回，bg_hold_ms=8 冒烟时主线程 D 从 1.6s 炸到 5.7s。
+ * FLUSH 走 blk_mq_request_bypass_insert 不进本队列；队头带 REQ_FUA/REQ_PREFLUSH 时
+ * 直接放行。被拒后由 bg_hold_work 在到期点重跑队列
+ * （blk_mq_run_hw_queues 已导出；blk_mq_delay_run_hw_queue 在本内核的模块符号表
+ * 里不存在）。core 只在 hctx->dispatch 非空时自我重跑，所以拒绝不会自旋。
+ */
+static unsigned int bg_hold_ms;
+module_param(bg_hold_ms, uint, 0644);
+MODULE_PARM_DESC(bg_hold_ms,
+		 "Hold the RT queue head this long before dispatching (0=off)");
+
+/*
+ * Scheduler-tag window for background reads. Writes use dd->async_depth (also
+ * sysfs-tunable). Exempt bios ignore both. 0 = that tier is off; both default
+ * off so the ladder only shapes a queue when it is explicitly armed.
+ */
+static unsigned int bg_read_tag_quota;
+module_param(bg_read_tag_quota, uint, 0644);
+MODULE_PARM_DESC(bg_read_tag_quota,
+		 "Concurrent scheduler tags allowed for background reads (0=off)");
 
 static bool dd_should_inline_dispatch(const struct request *rq)
 {
@@ -192,6 +224,10 @@ struct deadline_data {
 
 	struct dd_per_prio per_prio[DD_PRIO_COUNT];
 	struct smart_io_throttle_ctx throttle;
+
+	/* Replays dispatch when a held background queue expires. */
+	struct request_queue *queue;
+	struct delayed_work bg_hold_work;
 
 	/* Data direction of latest dispatched request. */
 	enum dd_data_dir last_dir;
@@ -1131,16 +1167,74 @@ static struct request *dd_dispatch_head(struct deadline_data *dd,
 	return rq;
 }
 
+static void dd_bg_hold_work_fn(struct work_struct *work)
+{
+	struct delayed_work *dwork = to_delayed_work(work);
+	struct deadline_data *dd = container_of(dwork, struct deadline_data,
+						bg_hold_work);
+
+	blk_mq_run_hw_queues(dd->queue, true);
+}
+
+/*
+ * Time-shape a background queue: RT carries every non-RT read. Only the queue's
+ * oldest request decides, so a held queue always releases at a known time and
+ * cannot be starved indefinitely. Requests parked on the dispatch list and
+ * FUA/preflush heads are never held. BE (writes) is not gated - see
+ * dd_dispatch_request(). Caller holds dd->lock.
+ */
+static bool dd_bg_held(struct dd_per_prio *per_prio, unsigned long now,
+		       unsigned int *remain_ms)
+{
+	struct request *head, *read_rq, *write_rq;
+	unsigned long expire;
+
+	if (!bg_hold_ms)
+		return false;
+	if (!list_empty(&per_prio->dispatch))
+		return false;
+
+	read_rq = list_first_entry_or_null(&per_prio->fifo_list[DD_READ],
+					   struct request, queuelist);
+	write_rq = list_first_entry_or_null(&per_prio->fifo_list[DD_WRITE],
+					    struct request, queuelist);
+	if (!read_rq)
+		head = write_rq;
+	else if (!write_rq)
+		head = read_rq;
+	else
+		head = time_before((unsigned long)read_rq->fifo_time,
+				   (unsigned long)write_rq->fifo_time) ?
+			read_rq : write_rq;
+	if (!head)
+		return false;
+	if (head->cmd_flags & (REQ_PREFLUSH | REQ_FUA))
+		return false;
+
+	expire = head->fifo_time + msecs_to_jiffies(bg_hold_ms);
+	if (time_after_eq(now, expire))
+		return false;
+
+	*remain_ms = jiffies_to_msecs(expire - now);
+	return true;
+}
+
 static struct request *dd_dispatch_request(struct blk_mq_hw_ctx *hctx)
 {
 	struct deadline_data *dd = hctx->queue->elevator->elevator_data;
+	const unsigned long now = jiffies;
 	struct request *rq = NULL;
+	unsigned int rt_remain = 0;
+	bool hold_rt;
 	bool vip_ok, nonvip_ok;
 	enum smart_io_dispatch_selection selection =
 		SMART_IO_SELECTION_BACKGROUND_BASELINE;
 
 	smart_io_throttle_dispatch_model_if_needed(&dd->throttle);
 	spin_lock(&dd->lock);
+	/* BE is deliberately not held: gating writes starved writeback and pushed
+	 * main-thread D from 1.6s to 5.7s in the bg_hold_ms=8 smoke run. */
+	hold_rt = dd_bg_held(&dd->per_prio[DD_RT_PRIO], now, &rt_remain);
 	if (!smart_io_throttle_enabled()) {
 		/*
 		 * No in-flight tokens: dispatch the head of each queue in
@@ -1149,7 +1243,7 @@ static struct request *dd_dispatch_request(struct blk_mq_hw_ctx *hctx)
 		 * with identical ordering.
 		 */
 		rq = dd_dispatch_head(dd, &dd->per_prio[DD_HP_PRIO]);
-		if (!rq)
+		if (!rq && !hold_rt)
 			rq = dd_dispatch_head(dd, &dd->per_prio[DD_RT_PRIO]);
 		if (!rq)
 			rq = dd_dispatch_head(dd, &dd->per_prio[DD_BE_PRIO]);
@@ -1158,7 +1252,7 @@ static struct request *dd_dispatch_request(struct blk_mq_hw_ctx *hctx)
 						  &nonvip_ok);
 		rq = dd_dispatch_hp(dd, &dd->per_prio[DD_HP_PRIO], vip_ok,
 				    nonvip_ok);
-		if (!rq && smart_io_throttle_non_hp_allowed(&dd->throttle,
+		if (!rq && !hold_rt && smart_io_throttle_non_hp_allowed(&dd->throttle,
 						SMART_IO_QUEUE_RT))
 			rq = dd_dispatch_fifo(dd, &dd->per_prio[DD_RT_PRIO]);
 		if (!rq && smart_io_throttle_non_hp_allowed(&dd->throttle,
@@ -1168,6 +1262,10 @@ static struct request *dd_dispatch_request(struct blk_mq_hw_ctx *hctx)
 	if (rq)
 		smart_io_throttle_account_dispatch(&dd->throttle, rq, selection);
 	spin_unlock(&dd->lock);
+
+	if (hold_rt)
+		mod_delayed_work(dd_dispatch_wq, &dd->bg_hold_work,
+				 msecs_to_jiffies(max_t(unsigned int, rt_remain, 1u)));
 
 	return rq;
 }
@@ -1187,22 +1285,32 @@ static int dd_to_word_depth(struct blk_mq_hw_ctx *hctx, unsigned int qdepth)
 }
 
 /*
- * Called by __blk_mq_alloc_request(). The shallow_depth value set by this
- * function is used by __blk_mq_get_tag().
+ * Admission ladder on the scheduler-tag pool. sbitmap only honours a per-word
+ * prefix, so the windows nest: background reads may use the lowest
+ * bg_read_tag_quota tags, writes up to the wider dd->async_depth, and bios
+ * stamped exempt at bio-queue time (VIP/HP hint or IOPRIO_CLASS_RT) ride the
+ * whole pool. The exemption is a blk_opf bit and not an ioprio test because
+ * blk-mq has not copied bi_ioprio into the request when this hook runs. blk-mq
+ * skips limit_depth for FLUSH and passthrough, so those are exempt by
+ * construction, and requests taken off the plug's cached list never reach here
+ * (their tag was already allocated by the bio that filled the cache).
+ * dd_to_word_depth() normalises a queue-wide count to per-word bits, so the
+ * quotas mean the same thing whatever nr_requests is. A quota of 0 or more than
+ * the pool disables it.
  */
 static void dd_limit_depth(blk_opf_t opf, struct blk_mq_alloc_data *data)
 {
 	struct deadline_data *dd = data->q->elevator->elevator_data;
+	unsigned int quota;
 
-	/* Do not throttle synchronous reads. */
-	if (op_is_sync(opf) && !op_is_write(opf))
+	if (opf & SMART_IO_OPF_SCHED_EXEMPT)
 		return;
 
-	/*
-	 * Throttle asynchronous requests and writes such that these requests
-	 * do not block the allocation of synchronous requests.
-	 */
-	data->shallow_depth = dd_to_word_depth(data->hctx, dd->async_depth);
+	quota = op_is_write(opf) ? dd->async_depth : bg_read_tag_quota;
+	if (!quota || quota >= data->q->nr_requests)
+		return;
+
+	data->shallow_depth = dd_to_word_depth(data->hctx, quota);
 }
 
 /* Called by blk_mq_update_nr_requests(). */
@@ -1212,6 +1320,9 @@ static void dd_depth_updated(struct blk_mq_hw_ctx *hctx)
 	struct deadline_data *dd = q->elevator->elevator_data;
 	struct blk_mq_tags *tags = hctx->sched_tags;
 
+	/* async_depth is the write tier of the admission ladder (see
+	 * dd_limit_depth); the read tier is bg_read_tag_quota. Full pool by
+	 * default, which disables the tier. */
 	dd->async_depth = q->nr_requests;
 
 	sbitmap_queue_min_shallow_depth(&tags->bitmap_tags, 1);
@@ -1237,6 +1348,7 @@ static void dd_exit_sched(struct elevator_queue *e)
 	struct deadline_data *dd = e->elevator_data;
 	enum dd_prio prio;
 
+	cancel_delayed_work_sync(&dd->bg_hold_work);
 	smart_io_throttle_queue_exit(&dd->throttle);
 
 	for (prio = 0; prio <= DD_PRIO_MAX; prio++) {
@@ -1298,6 +1410,8 @@ static int dd_init_sched(struct request_queue *q, struct elevator_type *e)
 	dd->fifo_batch = fifo_batch;
 	dd->prio_aging_expire = prio_aging_expire;
 	spin_lock_init(&dd->lock);
+	dd->queue = q;
+	INIT_DELAYED_WORK(&dd->bg_hold_work, dd_bg_hold_work_fn);
 
 	/* We dispatch from request queue wide instead of hw queue */
 	blk_queue_flag_set(QUEUE_FLAG_SQ_SCHED, q);

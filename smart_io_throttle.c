@@ -65,8 +65,9 @@ static atomic_t background_deadline_ms =
  * complete). No starvation backstop. Runtime knob
  * (/proc/smart_io_sched/queue_tokens). */
 static atomic_t queue_tokens[SMART_IO_TOKEN_COUNT];
-/* Floor policy: writes always BE, reads never below RT. */
-static atomic_t inflight_floor = ATOMIC_INIT(0);
+/* Floor policy: writes always BE, reads never below RT. Default on keeps
+ * low-priority reads in the RT slot so that BE stays the write-only queue. */
+static atomic_t inflight_floor = ATOMIC_INIT(1);
 /* Per-uid (per-app) in-flight token table: when the foreground app's uid has
  * an entry, its tokens[] override the global queue_tokens for that app's IO
  * (the caps are applied to the per-queue in-flight counts). 0 = uncapped for
@@ -196,11 +197,15 @@ u64 smart_io_throttle_request_id(const struct request *rq)
 	return meta ? READ_ONCE(meta->rq_id) : 0;
 }
 
+/*
+ * Queue routing: HP = VIP/HP hints + IOPRIO_CLASS_RT reads, RT = every other
+ * read (the lowest read queue), BE = writes (the floor policy forces them).
+ */
 static enum smart_io_queue_class
 smart_io_throttle_queue_from_ioprio(u16 ioprio)
 {
 	return IOPRIO_PRIO_CLASS(ioprio) == IOPRIO_CLASS_RT ?
-		SMART_IO_QUEUE_RT : SMART_IO_QUEUE_BE;
+		SMART_IO_QUEUE_HP : SMART_IO_QUEUE_RT;
 }
 
 /* Floor policy (inflight_floor): writes always go to BE; reads are never
@@ -1713,6 +1718,19 @@ smart_io_throttle_inference_timer(struct hrtimer *timer)
 	return HRTIMER_NORESTART;
 }
 
+/*
+ * blk-mq resets q->nr_requests to tag_set->queue_depth on every elevator switch
+ * (block/elevator.c:674), so a pool sized from the sched-tag count at init stays
+ * at 63 even after nr_requests is later widened to 224. Requests past that then
+ * fail to get meta, are not depth-accounted, and leak the RT/BE in-flight token
+ * caps. Floor the pool at init instead of resizing live pools: 0 keeps the
+ * sched-tag-derived size. Takes effect on the next elevator attach.
+ */
+static uint meta_pool_floor;
+module_param(meta_pool_floor, uint, 0644);
+MODULE_PARM_DESC(meta_pool_floor,
+		 "Minimum request-meta slots per queue (0 = size from sched tags)");
+
 static int smart_io_throttle_meta_capacity(struct request_queue *q,
 					   u32 *capacity)
 {
@@ -1737,7 +1755,7 @@ static int smart_io_throttle_meta_capacity(struct request_queue *q,
 	if (!tag_slots || !flush_slots ||
 	    check_add_overflow(tag_slots, flush_slots, &total))
 		return -EOVERFLOW;
-	*capacity = total;
+	*capacity = max_t(u32, total, READ_ONCE(meta_pool_floor));
 	return 0;
 }
 

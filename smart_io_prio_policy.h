@@ -6,6 +6,15 @@
 
 #include "smart_io_types.h"
 
+/*
+ * blk-mq copies bio->bi_ioprio into the request only after .limit_depth() has
+ * run, so the elevator's tag-admission hook cannot see ioprio class or our hint
+ * bits. Stamp the foreground exemption on the bio instead, using the blk_opf bit
+ * the kernel reserves for the submitter (REQ_FS_PRIVATE, bit 26; btrfs is its
+ * only consumer today). Set by smart_io_mark_bio_hint(), read by dd_limit_depth().
+ */
+#define SMART_IO_OPF_SCHED_EXEMPT	REQ_FS_PRIVATE
+
 bool is_hp_ioprio(u16 ioprio);
 bool is_vip_ioprio(u16 ioprio);
 bool has_smart_ioprio_hint(u16 ioprio);

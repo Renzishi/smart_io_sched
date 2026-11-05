@@ -169,6 +169,21 @@ void mark_bio_pi(struct bio *bio)
 			bio->bi_ioprio, hint);
 }
 
+/*
+ * Stamp the scheduler-tag exemption (SMART_IO_OPF_SCHED_EXEMPT) on the bio:
+ * VIP/HP-hinted and IOPRIO_CLASS_RT traffic rides the whole tag pool, everything
+ * else is background and gets capped by dd_limit_depth(). Must run after every
+ * mark_bio_* so it sees the final ioprio hints.
+ */
+static void mark_bio_sched_exempt(struct bio *bio)
+{
+	u16 ioprio = bio->bi_ioprio;
+
+	if (is_vip_ioprio(ioprio) || is_hp_ioprio(ioprio) ||
+	    IOPRIO_PRIO_CLASS(ioprio) == IOPRIO_CLASS_RT)
+		bio->bi_opf |= SMART_IO_OPF_SCHED_EXEMPT;
+}
+
 void smart_io_mark_bio_hint(struct bio *bio)
 {
 	mark_bio_pgf(bio);
@@ -179,4 +194,5 @@ void smart_io_mark_bio_hint(struct bio *bio)
 	 * 先前的标记依赖RT所以最后对前台请求标记RT优先级兜底
 	 */
 	mark_bio_rt(bio);
+	mark_bio_sched_exempt(bio);
 }

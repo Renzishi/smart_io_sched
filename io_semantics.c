@@ -642,8 +642,10 @@ static void emit_raw_insert(const struct smart_io_event *evt,
 
 	if (evt->thread_role == ROLE_FIO) {
 		smart_io_raw_emit("block_rq_insert: "
-			  "ts_insert=%llu rq_p=%p thread_role=%u tag_max=%u tag_cur=%u\n",
-			  evt->ts_insert, (void *)rq, evt->thread_role, tag_max, tag_used);
+			  "ts_insert=%llu rq_p=%p thread_role=%u tag_max=%u tag_cur=%u "
+			  "ioprio=%u\n",
+			  evt->ts_insert, (void *)rq, evt->thread_role, tag_max, tag_used,
+			  evt->ioprio);
 		return;
 	}
 
