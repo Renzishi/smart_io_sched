@@ -53,8 +53,8 @@ static const int fifo_batch = 16;       /* # of sequential requests treated as o
  * background reads get bg_read_tag_quota tags, writes get dd->async_depth, and
  * bios stamped exempt at bio-queue time ride the whole pool. Writes get the
  * wider window so that a flood of background reads can never push writes into a
- * tag wait - gating writes is what blew up main-thread D in the bg_hold_ms=8
- * smoke run. Both tiers default to off (0 / nr_requests).
+ * tag wait - gating writes is what blew up main-thread D in the early
+ * dispatch-hold experiment. Both tiers default to off (0 / nr_requests).
  */
 
 /*
@@ -83,18 +83,12 @@ MODULE_PARM_DESC(merge_last_insert,
 		 "Point q->last_merge at the most recently inserted request to enable back merges");
 
 /*
- * 后台时间整形：RT(后台读)队头不足 bg_hold_ms 就不派发，够老立即放行，所以 hold
- * 有界、后台一直有流量，只是被错峰成一段一段，不再靠突发把设备占满。0 = 关闭。
- * BE(写)不受此门控：限住写会饿死写回，bg_hold_ms=8 冒烟时主线程 D 从 1.6s 炸到 5.7s。
- * FLUSH 走 blk_mq_request_bypass_insert 不进本队列；队头带 REQ_FUA/REQ_PREFLUSH 时
- * 直接放行。被拒后由 bg_hold_work 在到期点重跑队列
- * （blk_mq_run_hw_queues 已导出；blk_mq_delay_run_hw_queue 在本内核的模块符号表
- * 里不存在）。core 只在 hctx->dispatch 非空时自我重跑，所以拒绝不会自旋。
+ * RT(后台读) 与 BE(写) 之间不做严格优先，按两队头里更老的先发（并列时先写），
+ * 两者仍然都在 HP 之下。最初的严格 RT->BE 让写被持续的后台读压到秒级：
+ * R64M 实测写 sched P50 28ms、P90 3.4s、56/238 条超过 1s，而按年龄取序后
+ * 变成 0 条超过 1s、max 39-207ms。写卡住会牵动写回/checkpoint，主线程在 S 上等，
+ * 所以这里宁可与后台读公平分摊，也不让写排在后台读之后。
  */
-static unsigned int bg_hold_ms;
-module_param(bg_hold_ms, uint, 0644);
-MODULE_PARM_DESC(bg_hold_ms,
-		 "Hold the RT queue head this long before dispatching (0=off)");
 
 /*
  * Scheduler-tag window for background reads. Writes use dd->async_depth (also
@@ -225,10 +219,6 @@ struct deadline_data {
 	struct dd_per_prio per_prio[DD_PRIO_COUNT];
 	struct smart_io_throttle_ctx throttle;
 
-	/* Replays dispatch when a held background queue expires. */
-	struct request_queue *queue;
-	struct delayed_work bg_hold_work;
-
 	/* Data direction of latest dispatched request. */
 	enum dd_data_dir last_dir;
 	unsigned int batching;		/* number of sequential requests made */
@@ -246,6 +236,8 @@ struct deadline_data {
 
 	spinlock_t lock;
 };
+
+
 
 /* Maps an I/O priority class to a deadline scheduler priority. */
 static const enum dd_prio ioprio_class_to_prio[] = {
@@ -1011,12 +1003,15 @@ static struct request *dd_dispatch_fifo(struct deadline_data *dd,
  * (UX reads) and non-VIP (foreground regular reads) requests; each has its own
  * in-flight token cap (vip_ok / nonvip_ok). A request whose class is at its
  * cap is skipped so a capped VIP at the head does not head-of-line-block a
- * dispatchable non-VIP behind it. Selection otherwise mirrors
- * dd_dispatch_fifo(). Caller holds dd->lock.
+ * dispatchable non-VIP behind it. hpw_ok is the separate cap on HP-queue
+ * writes (the foreground SYNC writes): when it is false the whole write side of
+ * the queue is skipped, so a capped write never blocks the reads behind it.
+ * Selection otherwise mirrors dd_dispatch_fifo(). Caller holds dd->lock.
  */
 static struct request *dd_dispatch_hp(struct deadline_data *dd,
 				      struct dd_per_prio *per_prio,
-				      bool vip_ok, bool nonvip_ok)
+				      bool vip_ok, bool nonvip_ok,
+				      bool hpw_ok)
 {
 	struct request *rq;
 	struct list_head *pos;
@@ -1028,8 +1023,9 @@ static struct request *dd_dispatch_hp(struct deadline_data *dd,
 	if (!list_empty(&per_prio->dispatch)) {
 		rq = list_first_entry(&per_prio->dispatch, struct request,
 				      queuelist);
-		if ((is_vip_request(rq) && vip_ok) ||
-		    (!is_vip_request(rq) && nonvip_ok))
+		if ((hpw_ok || !op_is_write(req_op(rq))) &&
+		    ((is_vip_request(rq) && vip_ok) ||
+		     (!is_vip_request(rq) && nonvip_ok)))
 			goto selected;
 	}
 
@@ -1045,7 +1041,8 @@ static struct request *dd_dispatch_hp(struct deadline_data *dd,
 
 		if (vr && !is_vip_request(vr))
 			vr = NULL;
-		if (vw && !is_vip_request(vw))
+		if (vw && (!is_vip_request(vw) ||
+			   (!hpw_ok && op_is_write(req_op(vw)))))
 			vw = NULL;
 		if (vr || vw) {
 			if (!vr)
@@ -1076,11 +1073,13 @@ static struct request *dd_dispatch_hp(struct deadline_data *dd,
 				break;
 			}
 		}
-		list_for_each(pos, &per_prio->fifo_list[DD_WRITE]) {
-			rq = list_entry(pos, struct request, queuelist);
-			if (!is_vip_request(rq)) {
-				w = rq;
-				break;
+		if (hpw_ok) {
+			list_for_each(pos, &per_prio->fifo_list[DD_WRITE]) {
+				rq = list_entry(pos, struct request, queuelist);
+				if (!is_vip_request(rq)) {
+					w = rq;
+					break;
+				}
 			}
 		}
 		if (r || w) {
@@ -1134,30 +1133,42 @@ static void dd_insert_fifo_request(struct dd_per_prio *per_prio,
  * list. Equivalent to dd_dispatch_hp() with both token classes open.
  * Caller holds dd->lock.
  */
-static struct request *dd_dispatch_head(struct deadline_data *dd,
-					struct dd_per_prio *per_prio)
+/*
+ * Head of one prio queue without dispatching it: the requeue list wins, otherwise
+ * the older of the read/write fifo heads. With allow_write off the write fifo is
+ * ignored, so a caller can skip a queue whose writes are currently capped.
+ * Caller holds dd->lock.
+ */
+static struct request *dd_peek_head(struct dd_per_prio *per_prio,
+				    bool allow_write)
 {
-	struct request *rq;
+	struct request *rq, *read_rq, *write_rq;
 
-	if (!list_empty(&per_prio->dispatch)) {
-		rq = list_first_entry(&per_prio->dispatch, struct request,
-					queuelist);
-	} else {
-		struct request *read_rq = list_first_entry_or_null(
-			&per_prio->fifo_list[DD_READ], struct request,
-			queuelist);
-		struct request *write_rq = list_first_entry_or_null(
-			&per_prio->fifo_list[DD_WRITE], struct request,
-			queuelist);
-		if (!read_rq)
-			rq = write_rq;
-		else if (!write_rq)
-			rq = read_rq;
-		else
-			rq = time_before((unsigned long)read_rq->fifo_time,
-					 (unsigned long)write_rq->fifo_time) ?
-				read_rq : write_rq;
-	}
+	rq = list_first_entry_or_null(&per_prio->dispatch, struct request,
+				      queuelist);
+	if (rq)
+		return rq;
+
+	read_rq = list_first_entry_or_null(&per_prio->fifo_list[DD_READ],
+					   struct request, queuelist);
+	write_rq = allow_write ?
+		list_first_entry_or_null(&per_prio->fifo_list[DD_WRITE],
+					 struct request, queuelist) : NULL;
+	if (!read_rq)
+		return write_rq;
+	if (!write_rq)
+		return read_rq;
+	return time_before((unsigned long)read_rq->fifo_time,
+			   (unsigned long)write_rq->fifo_time) ?
+		read_rq : write_rq;
+}
+
+static struct request *dd_dispatch_head(struct deadline_data *dd,
+					struct dd_per_prio *per_prio,
+					bool allow_write)
+{
+	struct request *rq = dd_peek_head(per_prio, allow_write);
+
 	if (!rq)
 		return NULL;
 
@@ -1167,105 +1178,83 @@ static struct request *dd_dispatch_head(struct deadline_data *dd,
 	return rq;
 }
 
-static void dd_bg_hold_work_fn(struct work_struct *work)
+static struct request *dd_dispatch_bg(struct deadline_data *dd,
+				      bool throttled)
 {
-	struct delayed_work *dwork = to_delayed_work(work);
-	struct deadline_data *dd = container_of(dwork, struct deadline_data,
-						bg_hold_work);
+	struct dd_per_prio *rt = &dd->per_prio[DD_RT_PRIO];
+	struct dd_per_prio *be = &dd->per_prio[DD_BE_PRIO];
+	enum dd_prio order[2] = { DD_RT_PRIO, DD_BE_PRIO };
+	struct request *rt_head = dd_peek_head(rt, true);
+	struct request *be_head = dd_peek_head(be, true);
+	int i;
 
-	blk_mq_run_hw_queues(dd->queue, true);
-}
+	/* Older head first; ties go to writes. */
+	if (rt_head && be_head &&
+	    time_before_eq((unsigned long)be_head->fifo_time,
+			   (unsigned long)rt_head->fifo_time)) {
+		order[0] = DD_BE_PRIO;
+		order[1] = DD_RT_PRIO;
+	}
 
-/*
- * Time-shape a background queue: RT carries every non-RT read. Only the queue's
- * oldest request decides, so a held queue always releases at a known time and
- * cannot be starved indefinitely. Requests parked on the dispatch list and
- * FUA/preflush heads are never held. BE (writes) is not gated - see
- * dd_dispatch_request(). Caller holds dd->lock.
- */
-static bool dd_bg_held(struct dd_per_prio *per_prio, unsigned long now,
-		       unsigned int *remain_ms)
-{
-	struct request *head, *read_rq, *write_rq;
-	unsigned long expire;
+	for (i = 0; i < 2; i++) {
+		enum dd_prio prio = order[i];
+		struct dd_per_prio *per_prio = prio == DD_RT_PRIO ? rt : be;
 
-	if (!bg_hold_ms)
-		return false;
-	if (!list_empty(&per_prio->dispatch))
-		return false;
+		if (throttled && !smart_io_throttle_non_hp_allowed(
+				&dd->throttle,
+				prio == DD_RT_PRIO ? SMART_IO_QUEUE_RT :
+						     SMART_IO_QUEUE_BE))
+			continue;
 
-	read_rq = list_first_entry_or_null(&per_prio->fifo_list[DD_READ],
-					   struct request, queuelist);
-	write_rq = list_first_entry_or_null(&per_prio->fifo_list[DD_WRITE],
-					    struct request, queuelist);
-	if (!read_rq)
-		head = write_rq;
-	else if (!write_rq)
-		head = read_rq;
-	else
-		head = time_before((unsigned long)read_rq->fifo_time,
-				   (unsigned long)write_rq->fifo_time) ?
-			read_rq : write_rq;
-	if (!head)
-		return false;
-	if (head->cmd_flags & (REQ_PREFLUSH | REQ_FUA))
-		return false;
+		if (throttled) {
+			struct request *rq = dd_dispatch_fifo(dd, per_prio);
 
-	expire = head->fifo_time + msecs_to_jiffies(bg_hold_ms);
-	if (time_after_eq(now, expire))
-		return false;
+			if (rq)
+				return rq;
+		} else {
+			struct request *rq = dd_dispatch_head(dd, per_prio,
+							      true);
 
-	*remain_ms = jiffies_to_msecs(expire - now);
-	return true;
+			if (rq)
+				return rq;
+		}
+	}
+
+	return NULL;
 }
 
 static struct request *dd_dispatch_request(struct blk_mq_hw_ctx *hctx)
 {
 	struct deadline_data *dd = hctx->queue->elevator->elevator_data;
-	const unsigned long now = jiffies;
 	struct request *rq = NULL;
-	unsigned int rt_remain = 0;
-	bool hold_rt;
 	bool vip_ok, nonvip_ok;
+	bool hpw_ok = smart_io_throttle_hp_write_allowed(&dd->throttle);
 	enum smart_io_dispatch_selection selection =
 		SMART_IO_SELECTION_BACKGROUND_BASELINE;
 
 	smart_io_throttle_dispatch_model_if_needed(&dd->throttle);
 	spin_lock(&dd->lock);
-	/* BE is deliberately not held: gating writes starved writeback and pushed
-	 * main-thread D from 1.6s to 5.7s in the bg_hold_ms=8 smoke run. */
-	hold_rt = dd_bg_held(&dd->per_prio[DD_RT_PRIO], now, &rt_remain);
 	if (!smart_io_throttle_enabled()) {
 		/*
 		 * No in-flight tokens: dispatch the head of each queue in
-		 * HP -> RT -> BE order. VIP requests already sit at the HP
+		 * HP -> (RT|BE) order. VIP requests already sit at the HP
 		 * fifo head, so this skips the token check and the list scan
 		 * with identical ordering.
 		 */
-		rq = dd_dispatch_head(dd, &dd->per_prio[DD_HP_PRIO]);
-		if (!rq && !hold_rt)
-			rq = dd_dispatch_head(dd, &dd->per_prio[DD_RT_PRIO]);
+		rq = dd_dispatch_head(dd, &dd->per_prio[DD_HP_PRIO], hpw_ok);
 		if (!rq)
-			rq = dd_dispatch_head(dd, &dd->per_prio[DD_BE_PRIO]);
+			rq = dd_dispatch_bg(dd, false);
 	} else {
 		smart_io_throttle_hp_token_state(&dd->throttle, &vip_ok,
 						  &nonvip_ok);
 		rq = dd_dispatch_hp(dd, &dd->per_prio[DD_HP_PRIO], vip_ok,
-				    nonvip_ok);
-		if (!rq && !hold_rt && smart_io_throttle_non_hp_allowed(&dd->throttle,
-						SMART_IO_QUEUE_RT))
-			rq = dd_dispatch_fifo(dd, &dd->per_prio[DD_RT_PRIO]);
-		if (!rq && smart_io_throttle_non_hp_allowed(&dd->throttle,
-						SMART_IO_QUEUE_BE))
-			rq = dd_dispatch_fifo(dd, &dd->per_prio[DD_BE_PRIO]);
+				    nonvip_ok, hpw_ok);
+		if (!rq)
+			rq = dd_dispatch_bg(dd, true);
 	}
 	if (rq)
 		smart_io_throttle_account_dispatch(&dd->throttle, rq, selection);
 	spin_unlock(&dd->lock);
-
-	if (hold_rt)
-		mod_delayed_work(dd_dispatch_wq, &dd->bg_hold_work,
-				 msecs_to_jiffies(max_t(unsigned int, rt_remain, 1u)));
 
 	return rq;
 }
@@ -1348,7 +1337,6 @@ static void dd_exit_sched(struct elevator_queue *e)
 	struct deadline_data *dd = e->elevator_data;
 	enum dd_prio prio;
 
-	cancel_delayed_work_sync(&dd->bg_hold_work);
 	smart_io_throttle_queue_exit(&dd->throttle);
 
 	for (prio = 0; prio <= DD_PRIO_MAX; prio++) {
@@ -1410,8 +1398,6 @@ static int dd_init_sched(struct request_queue *q, struct elevator_type *e)
 	dd->fifo_batch = fifo_batch;
 	dd->prio_aging_expire = prio_aging_expire;
 	spin_lock_init(&dd->lock);
-	dd->queue = q;
-	INIT_DELAYED_WORK(&dd->bg_hold_work, dd_bg_hold_work_fn);
 
 	/* We dispatch from request queue wide instead of hw queue */
 	blk_queue_flag_set(QUEUE_FLAG_SQ_SCHED, q);

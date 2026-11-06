@@ -19,10 +19,15 @@ static void tp_rq_insert_cb(void *ignore, struct request *rq)
 
 static void tp_bio_queue_cb(void *ignore, struct bio *bio)
 {
-	if (!bio || bio_op(bio) != REQ_OP_READ)
+	if (!bio)
 		return;
 
-	smart_io_mark_bio_hint(bio);
+	if (bio_op(bio) == REQ_OP_READ) {
+		smart_io_mark_bio_hint(bio);
+		return;
+	}
+
+	smart_io_mark_bio_write(bio);
 }
 
 static void tp_rq_issue_cb(void *ignore, struct request *rq)

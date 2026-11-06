@@ -68,6 +68,15 @@ static atomic_t queue_tokens[SMART_IO_TOKEN_COUNT];
 /* Floor policy: writes always BE, reads never below RT. Default on keeps
  * low-priority reads in the RT slot so that BE stays the write-only queue. */
 static atomic_t inflight_floor = ATOMIC_INIT(1);
+/* Cap on HP-queue in-flight writes, i.e. the foreground SYNC writes promoted
+ * off the BE backlog by smart_io_mark_bio_write(): 0 = uncapped. Unlike
+ * queue_tokens this bound also applies with the throttle off, because it is
+ * the backstop that keeps a foreground write storm off the read lane.
+ * Runtime knob (/sys/module/smart_io_sched/parameters/hp_write_tokens). */
+static uint hp_write_tokens = 2;
+module_param(hp_write_tokens, uint, 0644);
+MODULE_PARM_DESC(hp_write_tokens,
+		 "Max in-flight HP-queue writes, 0 = uncapped");
 /* Per-uid (per-app) in-flight token table: when the foreground app's uid has
  * an entry, its tokens[] override the global queue_tokens for that app's IO
  * (the caps are applied to the per-queue in-flight counts). 0 = uncapped for
@@ -198,8 +207,9 @@ u64 smart_io_throttle_request_id(const struct request *rq)
 }
 
 /*
- * Queue routing: HP = VIP/HP hints + IOPRIO_CLASS_RT reads, RT = every other
- * read (the lowest read queue), BE = writes (the floor policy forces them).
+ * Queue routing: HP = VIP/HP hints + IOPRIO_CLASS_RT reads + the foreground
+ * SYNC write, RT = every other read (the lowest read queue), BE = writes (the
+ * floor policy forces them, except an explicitly HP-routed foreground write).
  */
 static enum smart_io_queue_class
 smart_io_throttle_queue_from_ioprio(u16 ioprio)
@@ -210,13 +220,16 @@ smart_io_throttle_queue_from_ioprio(u16 ioprio)
 
 /* Floor policy (inflight_floor): writes always go to BE; reads are never
  * below RT. Applied to a freshly derived queue class only (already
- * classified requests carry the floored class in their metadata). */
+ * classified requests carry the floored class in their metadata). The floor
+ * does not demote a write that was explicitly routed to HP: that is the
+ * foreground SYNC write, and marking it at bio time is already gated on the
+ * same knob, so with the floor on no write ever reaches this exception. */
 static enum smart_io_queue_class
 smart_io_throttle_floor_queue_class(enum smart_io_queue_class qc, bool is_write)
 {
 	if (!smart_io_throttle_get_inflight_floor())
 		return qc;
-	if (is_write)
+	if (is_write && qc != SMART_IO_QUEUE_HP)
 		return SMART_IO_QUEUE_BE;
 	if (qc == SMART_IO_QUEUE_BE)
 		return SMART_IO_QUEUE_RT;
@@ -243,8 +256,13 @@ smart_io_throttle_select_queue(const struct request *rq)
 		return meta->queue_class;
 	op = req_op((struct request *)rq);
 	if (op_is_write(op)) {
-		qc = has_smart_ioprio_hint(ioprio) ?
-			SMART_IO_QUEUE_RT : SMART_IO_QUEUE_BE;
+		/* HP hint on a write is the foreground SYNC write (see
+		 * smart_io_mark_bio_write()); it keeps the HP route. */
+		if (is_hp_ioprio(ioprio))
+			qc = SMART_IO_QUEUE_HP;
+		else
+			qc = has_smart_ioprio_hint(ioprio) ?
+				SMART_IO_QUEUE_RT : SMART_IO_QUEUE_BE;
 	} else {
 		/*
 		 * RL-controlled READ (binary KEEP/ELEVATE, doc §B1): the RL
@@ -296,8 +314,11 @@ smart_io_throttle_select_bio_queue(const struct bio *bio)
 		return SMART_IO_QUEUE_BE;
 	op = bio_op(bio);
 	if (op_is_write(op)) {
-		qc = has_smart_ioprio_hint(bio->bi_ioprio) ?
-			SMART_IO_QUEUE_RT : SMART_IO_QUEUE_BE;
+		if (is_hp_ioprio(bio->bi_ioprio))
+			qc = SMART_IO_QUEUE_HP;
+		else
+			qc = has_smart_ioprio_hint(bio->bi_ioprio) ?
+				SMART_IO_QUEUE_RT : SMART_IO_QUEUE_BE;
 	} else {
 		/*
 		 * Hint bits are set at bio-queue time by tp_bio_queue_cb
@@ -531,6 +552,8 @@ static void smart_io_throttle_pressure_inflight_inc_locked(
 
 	if (meta->queue_class != SMART_IO_QUEUE_HP)
 		return;
+	if (meta->op == REQ_OP_WRITE)
+		atomic_inc(&ctx->hp_write_inflight);
 	smart_io_throttle_rl_pressure_classify(meta, ioprio, &vip, &rl_vip);
 	if (!vip) {
 		ctx->hp_nonvip_inflight++;
@@ -551,6 +574,9 @@ static void smart_io_throttle_pressure_inflight_dec_locked(
 
 	if (meta->queue_class != SMART_IO_QUEUE_HP)
 		return;
+	if (meta->op == REQ_OP_WRITE &&
+	    atomic_read(&ctx->hp_write_inflight) > 0)
+		atomic_dec(&ctx->hp_write_inflight);
 	smart_io_throttle_rl_pressure_classify(meta, ioprio, &vip, &rl_vip);
 	if (!vip) {
 		if (ctx->hp_nonvip_inflight)
@@ -778,6 +804,20 @@ void smart_io_throttle_hp_token_state(struct smart_io_throttle_ctx *ctx,
 	*nonvip_ok = smart_io_throttle_token_class_allowed_locked(ctx,
 			SMART_IO_TOKEN_HP);
 	spin_unlock_irqrestore(&ctx->lock, flags);
+}
+
+/* Whether one more HP-queue write may be dispatched (hp_write_tokens). Read
+ * lockless like the token caps: the counter is bounded by ctx->lock on both
+ * sides, so a stale value can only let one extra write through or hold one
+ * back until the next completion re-runs the queue. */
+bool smart_io_throttle_hp_write_allowed(struct smart_io_throttle_ctx *ctx)
+{
+	uint cap = READ_ONCE(hp_write_tokens);
+
+	if (!ctx || !cap)
+		return true;
+
+	return (uint)atomic_read(&ctx->hp_write_inflight) < cap;
 }
 
 static void smart_io_throttle_trace_decision(struct smart_io_throttle_ctx *ctx,

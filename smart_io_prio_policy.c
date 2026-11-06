@@ -10,6 +10,7 @@
 #include "tp_pi.h"
 #include "tp_filemap.h"
 #include "tool.h"
+#include "smart_io_throttle.h"
 
 /*
  * top-app 进程的所有 bio 默认提升为 IOPRIO_CLASS_RT（mark_bio_rt），且
@@ -194,5 +195,40 @@ void smart_io_mark_bio_hint(struct bio *bio)
 	 * 先前的标记依赖RT所以最后对前台请求标记RT优先级兜底
 	 */
 	mark_bio_rt(bio);
+	mark_bio_sched_exempt(bio);
+}
+
+/*
+ * Foreground synchronous writes. A SYNC write from the foreground app is on the
+ * submitting thread's critical path, so with the write floor released
+ * (inflight_floor=0) it rides the HP queue instead of the BE backlog; every
+ * other write keeps its background route. Writeback (REQ_BACKGROUND), journal
+ * and metadata (REQ_META), cache flushes (REQ_PREFLUSH) and anything above 64K
+ * are excluded so a write storm from the foreground app cannot take over the HP
+ * lane. REQ_FUA stays eligible: it is synchronous by definition.
+ *
+ * Marking only the HP route bit (not VIP/PGF/PI) keeps such a write in the
+ * non-VIP half of the HP queue, where dd_dispatch_hp() orders it by arrival
+ * against the foreground reads. With the floor on, nothing is marked at all and
+ * the write path is byte-for-byte the baseline.
+ */
+#define SMART_IO_FG_WRITE_HP_MAX_BYTES	(64 * 1024)
+
+void smart_io_mark_bio_write(struct bio *bio)
+{
+	if (smart_io_throttle_get_inflight_floor())
+		return;
+	if (bio_op(bio) != REQ_OP_WRITE)
+		return;
+	if (!(bio->bi_opf & REQ_SYNC) ||
+	    (bio->bi_opf & (REQ_BACKGROUND | REQ_META | REQ_PREFLUSH)))
+		return;
+	if (bio->bi_iter.bi_size > SMART_IO_FG_WRITE_HP_MAX_BYTES)
+		return;
+	if (!current_uid_is_fg())
+		return;
+
+	bio->bi_ioprio = set_private_hint(bio->bi_ioprio,
+		SMART_IO_HP_IOPRIO_HINT);
 	mark_bio_sched_exempt(bio);
 }

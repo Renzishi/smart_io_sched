@@ -3,6 +3,7 @@
 #define SMART_IO_THROTTLE_H
 
 #include <linux/blk-mq.h>
+#include <linux/atomic.h>
 #include <linux/completion.h>
 #include <linux/hashtable.h>
 #include <linux/hrtimer.h>
@@ -191,6 +192,9 @@ struct smart_io_throttle_ctx {
 	u32 hp_vip_inflight;
 	u32 hp_nonvip_wait;
 	u32 hp_nonvip_inflight;
+	/* In-flight writes of the HP queue (foreground SYNC writes), capped by
+	 * the hp_write_tokens module parameter. */
+	atomic_t hp_write_inflight;
 	u32 rt_wait;
 	u32 be_wait;
 	u32 native_vip_wait;
@@ -406,6 +410,9 @@ bool smart_io_throttle_token_class_allowed_locked(
  * under the token caps (takes ctx->lock). */
 void smart_io_throttle_hp_token_state(struct smart_io_throttle_ctx *ctx,
 		bool *vip_ok, bool *nonvip_ok);
+/* Whether one more HP-queue write may be dispatched under hp_write_tokens.
+ * Read lockless, applies with the throttle off as well. */
+bool smart_io_throttle_hp_write_allowed(struct smart_io_throttle_ctx *ctx);
 int smart_io_throttle_set_ratios(u32 light_pct, u32 medium_pct,
 				 u32 heavy_pct);
 void smart_io_throttle_get_ratios(u32 *light_pct, u32 *medium_pct,

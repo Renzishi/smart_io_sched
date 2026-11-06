@@ -21,5 +21,6 @@ bool has_smart_ioprio_hint(u16 ioprio);
 bool is_vip_request(const struct request *rq);
 void mark_request_vip_pi(struct request *rq);
 void smart_io_mark_bio_hint(struct bio *bio);
+void smart_io_mark_bio_write(struct bio *bio);
 
 #endif
