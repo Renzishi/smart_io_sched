@@ -50,11 +50,10 @@ static const int fifo_batch = 16;       /* # of sequential requests treated as o
 
 /*
  * Scheduler-tag admission ladder (nested prefixes, see dd_limit_depth()):
- * background reads get bg_read_tag_quota tags, writes get dd->async_depth, and
- * bios stamped exempt at bio-queue time ride the whole pool. Writes get the
- * wider window so that a flood of background reads can never push writes into a
- * tag wait - gating writes is what blew up main-thread D in the early
- * dispatch-hold experiment. Both tiers default to off (0 / nr_requests).
+ * writes are limited to dd->async_depth tags, and bios stamped exempt at
+ * bio-queue time (VIP/HP hint or IOPRIO_CLASS_RT) ride the whole pool. Gating
+ * writes is what blew up main-thread D in the early dispatch-hold experiment,
+ * so the write window defaults to the full pool (nr_requests = off).
  */
 
 /*
@@ -73,32 +72,12 @@ MODULE_PARM_DESC(hp_inline_dispatch,
 		 "Run the hw queue synchronously after inserting an HP/VIP read request");
 
 /*
- * 让 insert-merge 命中“前一条插入的请求”：内核 elv_attempt_insert_merge()
- * 只检查 q->last_merge（通常指向队头）和按起始扇区的哈希，深队列 FIFO 下
- * 相邻 4K 永远合不上。打开后每次插入前把 q->last_merge 指向前一条。
- */
-static bool merge_last_insert;
-module_param(merge_last_insert, bool, 0644);
-MODULE_PARM_DESC(merge_last_insert,
-		 "Point q->last_merge at the most recently inserted request to enable back merges");
-
-/*
  * RT(后台读) 与 BE(写) 之间不做严格优先，按两队头里更老的先发（并列时先写），
  * 两者仍然都在 HP 之下。最初的严格 RT->BE 让写被持续的后台读压到秒级：
  * R64M 实测写 sched P50 28ms、P90 3.4s、56/238 条超过 1s，而按年龄取序后
  * 变成 0 条超过 1s、max 39-207ms。写卡住会牵动写回/checkpoint，主线程在 S 上等，
  * 所以这里宁可与后台读公平分摊，也不让写排在后台读之后。
  */
-
-/*
- * Scheduler-tag window for background reads. Writes use dd->async_depth (also
- * sysfs-tunable). Exempt bios ignore both. 0 = that tier is off; both default
- * off so the ladder only shapes a queue when it is explicitly armed.
- */
-static unsigned int bg_read_tag_quota;
-module_param(bg_read_tag_quota, uint, 0644);
-MODULE_PARM_DESC(bg_read_tag_quota,
-		 "Concurrent scheduler tags allowed for background reads (0=off)");
 
 static bool dd_should_inline_dispatch(const struct request *rq)
 {
@@ -1274,32 +1253,28 @@ static int dd_to_word_depth(struct blk_mq_hw_ctx *hctx, unsigned int qdepth)
 }
 
 /*
- * Admission ladder on the scheduler-tag pool. sbitmap only honours a per-word
- * prefix, so the windows nest: background reads may use the lowest
- * bg_read_tag_quota tags, writes up to the wider dd->async_depth, and bios
- * stamped exempt at bio-queue time (VIP/HP hint or IOPRIO_CLASS_RT) ride the
- * whole pool. The exemption is a blk_opf bit and not an ioprio test because
- * blk-mq has not copied bi_ioprio into the request when this hook runs. blk-mq
- * skips limit_depth for FLUSH and passthrough, so those are exempt by
- * construction, and requests taken off the plug's cached list never reach here
- * (their tag was already allocated by the bio that filled the cache).
- * dd_to_word_depth() normalises a queue-wide count to per-word bits, so the
- * quotas mean the same thing whatever nr_requests is. A quota of 0 or more than
- * the pool disables it.
+ * Admission window on the scheduler-tag pool for writes (dd->async_depth).
+ * sbitmap only honours a per-word prefix, so the write window is normalised by
+ * dd_to_word_depth(); a window of 0 or >= nr_requests disables it. Bios stamped
+ * exempt at bio-queue time (VIP/HP hint or IOPRIO_CLASS_RT) ride the whole pool.
+ * The exemption is a blk_opf bit and not an ioprio test because blk-mq has not
+ * copied bi_ioprio into the request when this hook runs. blk-mq skips
+ * limit_depth for FLUSH and passthrough, so those are exempt by construction,
+ * and requests taken off the plug's cached list never reach here (their tag was
+ * already allocated by the bio that filled the cache).
  */
 static void dd_limit_depth(blk_opf_t opf, struct blk_mq_alloc_data *data)
 {
 	struct deadline_data *dd = data->q->elevator->elevator_data;
-	unsigned int quota;
 
+	if (!op_is_write(opf))
+		return;
 	if (opf & SMART_IO_OPF_SCHED_EXEMPT)
 		return;
-
-	quota = op_is_write(opf) ? dd->async_depth : bg_read_tag_quota;
-	if (!quota || quota >= data->q->nr_requests)
+	if (!dd->async_depth || dd->async_depth >= data->q->nr_requests)
 		return;
 
-	data->shallow_depth = dd_to_word_depth(data->hctx, quota);
+	data->shallow_depth = dd_to_word_depth(data->hctx, dd->async_depth);
 }
 
 /* Called by blk_mq_update_nr_requests(). */
@@ -1309,9 +1284,8 @@ static void dd_depth_updated(struct blk_mq_hw_ctx *hctx)
 	struct deadline_data *dd = q->elevator->elevator_data;
 	struct blk_mq_tags *tags = hctx->sched_tags;
 
-	/* async_depth is the write tier of the admission ladder (see
-	 * dd_limit_depth); the read tier is bg_read_tag_quota. Full pool by
-	 * default, which disables the tier. */
+	/* async_depth is the write window of the admission ladder (see
+	 * dd_limit_depth). Full pool by default, which disables it. */
 	dd->async_depth = q->nr_requests;
 
 	sbitmap_queue_min_shallow_depth(&tags->bitmap_tags, 1);
@@ -1469,33 +1443,6 @@ static bool dd_bio_merge(struct request_queue *q, struct bio *bio,
 }
 
 /*
- * 找到同 prio/方向里“尾部正好接上新请求起始扇区”的排队请求（back merge 目标）。
- * 请求流会和其它文件交错，不能只看“上一次插入”；rbtree 以起始扇区为键，
- * 这里做前驱查找，再校验尾部是否相接。
- */
-static struct request *dd_find_back_merge_target(struct dd_per_prio *per_prio,
-						 struct request *rq)
-{
-	struct rb_node *node = per_prio->sort_list[rq_data_dir(rq)].rb_node;
-	struct request *best = NULL;
-
-	while (node) {
-		struct request *cur = rb_entry(node, struct request, rb_node);
-
-		if (blk_rq_pos(cur) < blk_rq_pos(rq)) {
-			best = cur;
-			node = node->rb_right;
-		} else {
-			node = node->rb_left;
-		}
-	}
-
-	if (best && blk_rq_pos(best) + blk_rq_sectors(best) == blk_rq_pos(rq))
-		return best;
-	return NULL;
-}
-
-/*
  * add rq to rbtree and fifo
  */
 static void dd_insert_request(struct blk_mq_hw_ctx *hctx, struct request *rq,
@@ -1523,12 +1470,6 @@ static void dd_insert_request(struct blk_mq_hw_ctx *hctx, struct request *rq,
 		per_prio->stats.inserted++;
 	rq->elv.priv[0] = per_prio;
 
-	if (merge_last_insert) {
-		struct request *prev = dd_find_back_merge_target(per_prio, rq);
-
-		if (prev)
-			q->last_merge = prev;
-	}
 	if (blk_mq_sched_try_insert_merge(q, rq, free))
 		return;
 

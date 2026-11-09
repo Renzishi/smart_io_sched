@@ -55,8 +55,6 @@ struct smart_io_throttle_config {
 
 static atomic_t throttle_enabled = ATOMIC_INIT(0);
 static atomic_t queue_rq_throttle_demo = ATOMIC_INIT(0);
-static atomic_t ux_hp_enabled = ATOMIC_INIT(0);
-static atomic_t rt_read_hp_enabled = ATOMIC_INIT(0);
 static atomic_t dev_lat_threshold_us = ATOMIC_INIT(SMART_IO_DEFAULT_DEV_LAT_US);
 static atomic_t background_deadline_ms =
 	ATOMIC_INIT(SMART_IO_DEFAULT_BACKGROUND_DEADLINE_MS);
@@ -83,6 +81,10 @@ MODULE_PARM_DESC(hp_write_tokens,
  * that class. Written via /proc/smart_io_sched/app_token (rare); read
  * lockless (READ_ONCE) in the dispatch hot path. */
 static struct smart_io_app_token_entry app_token_table[SMART_IO_APP_TOKEN_MAX];
+/* Number of valid entries in app_token_table. Read lockless by the dispatch
+ * hot path so the table scan is skipped entirely while it is 0, which is the
+ * normal configuration. Updated under throttle_config_lock. */
+static u32 app_token_valid;
 static DEFINE_SPINLOCK(throttle_config_lock);
 static struct smart_io_throttle_config throttle_config = {
 	.light_pct = SMART_IO_DEFAULT_LIGHT_PCT,
@@ -333,28 +335,6 @@ smart_io_throttle_select_bio_queue(const struct bio *bio)
 			qc = smart_io_throttle_queue_from_ioprio(bio->bi_ioprio);
 	}
 	return smart_io_throttle_floor_queue_class(qc, op_is_write(op));
-}
-
-int smart_io_throttle_set_ux_hp_enable(bool enabled)
-{
-	atomic_set(&ux_hp_enabled, enabled ? 1 : 0);
-	return 0;
-}
-
-bool smart_io_throttle_get_ux_hp_enable(void)
-{
-	return atomic_read(&ux_hp_enabled) != 0;
-}
-
-int smart_io_throttle_set_rt_read_hp_enable(bool enabled)
-{
-	atomic_set(&rt_read_hp_enabled, enabled ? 1 : 0);
-	return 0;
-}
-
-bool smart_io_throttle_get_rt_read_hp_enable(void)
-{
-	return atomic_read(&rt_read_hp_enabled) != 0;
 }
 
 static enum smart_io_rq_class
@@ -753,7 +733,7 @@ bool smart_io_throttle_token_class_allowed_locked(
 
 	/* Per-uid (per-app) override: if the foreground app has an entry in
 	 * the app_token table, use its token for this class (0 = uncapped). */
-	if (fg_uid >= 0) {
+	if (fg_uid >= 0 && READ_ONCE(app_token_valid)) {
 		for (i = 0; i < SMART_IO_APP_TOKEN_MAX; i++) {
 			if (READ_ONCE(app_token_table[i].valid) &&
 			    READ_ONCE(app_token_table[i].uid) == (u32)fg_uid) {
@@ -794,6 +774,17 @@ void smart_io_throttle_hp_token_state(struct smart_io_throttle_ctx *ctx,
 	unsigned long flags;
 
 	if (!ctx || !smart_io_throttle_enabled()) {
+		*vip_ok = true;
+		*nonvip_ok = true;
+		return;
+	}
+	/* Steady state: no per-app override and both HP-side caps open means
+	 * smart_io_throttle_token_class_allowed_locked() returns true for both
+	 * classes whatever the in-flight counts are. Answer without touching
+	 * ctx->lock, which this function otherwise takes on every dispatch. */
+	if (!READ_ONCE(app_token_valid) &&
+	    !atomic_read(&queue_tokens[SMART_IO_TOKEN_VIP]) &&
+	    !atomic_read(&queue_tokens[SMART_IO_TOKEN_HP])) {
 		*vip_ok = true;
 		*nonvip_ok = true;
 		return;
@@ -1647,6 +1638,10 @@ bool smart_io_throttle_model_dispatch_needed(struct smart_io_throttle_ctx *ctx)
 
 	if (!ctx || !smart_io_throttle_enabled())
 		return false;
+	/* The predicate below implies inference_pending, so a clear flag answers
+	 * it without the ctx->lock this needs on every dd_has_work() call. */
+	if (!READ_ONCE(ctx->inference_pending))
+		return false;
 
 	spin_lock_irqsave(&ctx->lock, flags);
 	needed = smart_io_throttle_model_dispatch_needed_locked(ctx);
@@ -1668,6 +1663,10 @@ void smart_io_throttle_dispatch_model_if_needed(
 	bool wake = false;
 
 	if (!ctx || !smart_io_throttle_enabled())
+		return;
+	/* Nothing to submit unless a model state is pending; skip the ctx->lock
+	 * that this otherwise takes at the head of every dispatch. */
+	if (!READ_ONCE(ctx->inference_pending))
 		return;
 
 	spin_lock_irqsave(&ctx->lock, flags);
@@ -3196,6 +3195,8 @@ int smart_io_throttle_set_app_token(u32 uid, u32 vip, u32 hp, u32 rt, u32 be)
 	app_token_table[slot].uid = uid;
 	for (i = 0; i < SMART_IO_TOKEN_COUNT; i++)
 		app_token_table[slot].tokens[i] = values[i];
+	if (!app_token_table[slot].valid)
+		app_token_valid++;
 	app_token_table[slot].valid = true;
 	spin_unlock_irqrestore(&throttle_config_lock, flags);
 	return 0;
@@ -3210,6 +3211,7 @@ int smart_io_throttle_clear_app_tokens(void)
 	spin_lock_irqsave(&throttle_config_lock, flags);
 	for (i = 0; i < SMART_IO_APP_TOKEN_MAX; i++)
 		app_token_table[i].valid = false;
+	app_token_valid = 0;
 	spin_unlock_irqrestore(&throttle_config_lock, flags);
 	return 0;
 }

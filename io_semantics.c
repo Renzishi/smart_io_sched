@@ -642,9 +642,9 @@ static void emit_raw_insert(const struct smart_io_event *evt,
 
 	if (evt->thread_role == ROLE_FIO) {
 		smart_io_raw_emit("block_rq_insert: "
-			  "ts_insert=%llu rq_p=%p thread_role=%u tag_max=%u tag_cur=%u "
+			  "ts_insert=%llu uid=%u rq_p=%p io_size=%u cmd=%u thread_role=%u tag_max=%u tag_cur=%u "
 			  "ioprio=%u\n",
-			  evt->ts_insert, (void *)rq, evt->thread_role, tag_max, tag_used,
+			  evt->ts_insert, evt->uid, (void *)rq, blk_rq_bytes(rq), rq->cmd_flags, evt->thread_role, tag_max, tag_used,
 			  evt->ioprio);
 		return;
 	}
@@ -683,8 +683,8 @@ static void emit_raw_issue(const struct smart_io_event *evt,
 
 	if (evt->thread_role == ROLE_FIO) {
 		smart_io_raw_emit("block_rq_issue: "
-			  "ts_issue=%llu rq_p=%p thread_role=%u tag_max=%u tag_cur=%u\n",
-			  evt->ts_issue, (void *)rq, evt->thread_role, tag_max, tag_used);
+			  "ts_issue=%llu uid=%u rq_p=%p thread_role=%u tag_max=%u tag_cur=%u\n",
+			  evt->ts_issue, evt->uid, (void *)rq, evt->thread_role, tag_max, tag_used);
 		return;
 	}
 
@@ -726,8 +726,8 @@ static void emit_raw_requeue(const struct smart_io_event *evt,
 
 	if (evt->thread_role == ROLE_FIO) {
 		smart_io_raw_emit("block_rq_requeue: "
-			  "ts_requeue=%llu rq_p=%p tag_max=%u tag_cur=%u\n",
-			  ktime_get_boottime_ns(), (void *)rq, tag_max, tag_used);
+			  "ts_requeue=%llu uid=%u rq_p=%p tag_max=%u tag_cur=%u\n",
+			  ktime_get_boottime_ns(), evt->uid, (void *)rq, tag_max, tag_used);
 		return;
 	}
 
@@ -745,8 +745,8 @@ static void emit_raw_complete(const struct smart_io_event *evt,
 {
 	if (evt->thread_role == ROLE_FIO) {
 		smart_io_raw_emit("block_rq_complete: "
-			  "ts_complete=%llu rq_p=%p\n",
-			  evt->ts_complete, (void *)rq);
+			  "ts_complete=%llu uid=%u rq_p=%p\n",
+			  evt->ts_complete, evt->uid, (void *)rq);
 		return;
 	}
 	smart_io_raw_emit("block_rq_complete: "
