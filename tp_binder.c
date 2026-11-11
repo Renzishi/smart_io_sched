@@ -25,6 +25,20 @@ extern atomic_t smart_io_enabled;
 extern atomic_t rawdata_trace_enabled;
 
 struct binder_transaction;
+struct binder_proc;
+
+/*
+ * main_in_binder: the fg main thread issued a synchronous binder call
+ * and has not yet received the reply. Single slot: a thread can only
+ * have one outstanding synchronous transaction at a time. The TTL is a
+ * safety net for a missed clear (e.g. the caller died mid-call).
+ */
+#define MAIN_IN_BINDER_TTL_NS (100ULL * NSEC_PER_MSEC)
+
+static atomic_t main_in_binder_dir = ATOMIC_INIT(0);
+static atomic_t main_in_binder_tid = ATOMIC_INIT(0);
+static atomic_t main_in_binder_peer = ATOMIC_INIT(0);
+static u64 main_in_binder_expire_ns;
 
 struct binder_pi_entry {
 	pid_t pid;
@@ -202,6 +216,10 @@ void smart_io_binder_pi_clear_all(const char *reason)
 	int active;
 	int i;
 
+	atomic_set(&main_in_binder_dir, 0);
+	atomic_set(&main_in_binder_tid, 0);
+	atomic_set(&main_in_binder_peer, 0);
+
 	spin_lock_irqsave(&binder_pi_lock, flags);
 	for (i = 0; i < BINDER_PI_SLOTS; i++) {
 		binder_pi_slots[i].pid = 0;
@@ -214,6 +232,21 @@ void smart_io_binder_pi_clear_all(const char *reason)
 	if (active && binder_pi_raw_enabled())
 		smart_io_raw_emit("binder_pi_clear_all: ts=%llu active=%d reason=%s\n",
 				  ktime_get_boottime_ns(), active, reason);
+}
+
+/*
+ * True while the fg main thread has an unanswered synchronous binder
+ * call. The TTL applies so a leaked mark cannot stick forever.
+ */
+bool smart_io_main_in_binder(void)
+{
+	if (atomic_read(&main_in_binder_dir) == 0)
+		return false;
+	if (ktime_get_boottime_ns() > main_in_binder_expire_ns) {
+		atomic_set(&main_in_binder_dir, 0);
+		return false;
+	}
+	return true;
 }
 
 static void tp_sync_txn_recvd_cb(void *ignore, struct task_struct *tsk,
@@ -230,6 +263,19 @@ static void tp_sync_txn_recvd_cb(void *ignore, struct task_struct *tsk,
 		return;
 
 	now = ktime_get_boottime_ns();
+
+	/*
+	 * Clear main_in_binder when the reply reaches the main thread. tsk is
+	 * the receiving thread, so a match means the caller got its answer.
+	 * The peer tgid check keeps an unrelated incoming call from clearing
+	 * a wait that is still outstanding.
+	 */
+	if (tsk->pid == atomic_read(&main_in_binder_tid) &&
+	    (atomic_read(&main_in_binder_peer) == 0 ||
+	     from->tgid == atomic_read(&main_in_binder_peer))) {
+		atomic_set(&main_in_binder_dir, 0);
+		atomic_set(&main_in_binder_tid, 0);
+	}
 
 	if (task_is_fg_main(from)) {
 		binder_pi_mark(tsk->pid, tsk->comm, 1, now);
@@ -258,11 +304,43 @@ static void tp_binder_transaction_record_cb(void *ignore,
 	binder_pi_clear_pid(current->pid, current->comm, "reply");
 }
 
+/*
+ * A synchronous (non-ONE_WAY) transaction was just queued to a target.
+ * current is the caller, so this is where the main thread starts waiting.
+ * binder_th_task is the receiving thread (its tgid is the callee proc);
+ * it is NULL when the work went to the proc queue instead.
+ */
+static void tp_proc_transaction_finish_cb(void *ignore,
+					  struct binder_proc *proc,
+					  struct binder_transaction *t,
+					  struct task_struct *binder_th_task,
+					  bool pending_async, bool sync)
+{
+	(void)ignore;
+	(void)proc;
+	(void)t;
+	(void)pending_async;
+
+	if (!sync || atomic_read(&smart_io_enabled) == 0)
+		return;
+	if (!task_is_fg_main(current))
+		return;
+
+	atomic_set(&main_in_binder_peer,
+		   binder_th_task ? binder_th_task->tgid : 0);
+	main_in_binder_expire_ns = ktime_get_boottime_ns() +
+				   MAIN_IN_BINDER_TTL_NS;
+	atomic_set(&main_in_binder_tid, current->pid);
+	atomic_set(&main_in_binder_dir, 1);
+}
+
 static struct tracepoints_table interests[] = {
 	{ .name = "android_vh_sync_txn_recvd",
 	  .func = tp_sync_txn_recvd_cb },
 	{ .name = "android_vh_binder_transaction_record",
 	  .func = tp_binder_transaction_record_cb },
+	{ .name = "android_vh_binder_proc_transaction_finish",
+	  .func = tp_proc_transaction_finish_cb },
 };
 
 #define FOR_EACH_INTEREST(i) \

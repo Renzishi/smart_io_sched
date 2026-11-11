@@ -17,10 +17,27 @@ static void tp_rq_insert_cb(void *ignore, struct request *rq)
 	smart_io_record_insert(rq);
 }
 
+static u64 bio_probe_total;
+static int bio_probe_proof;
+
 static void tp_bio_queue_cb(void *ignore, struct bio *bio)
 {
 	if (!bio)
 		return;
+
+	/*
+	 * Liveness probe, sampled: the trace instance is only enabled around the
+	 * launch window, so emitting the first few bios would write into a disabled
+	 * instance and be dropped. One in every 20000 keeps the samples spread over
+	 * the whole capture so some land inside the window.
+	 */
+	bio_probe_total++;
+	if (bio_probe_proof < 30 && (bio_probe_total % 20000) == 0) {
+		bio_probe_proof++;
+		smart_io_raw_emit("bio_probe_proof: seq=%d total=%llu op=%u size=%u comm=%s\n",
+				  bio_probe_proof, bio_probe_total, bio_op(bio),
+				  bio->bi_iter.bi_size, current->comm);
+	}
 
 	if (bio_op(bio) == REQ_OP_READ) {
 		smart_io_mark_bio_hint(bio);

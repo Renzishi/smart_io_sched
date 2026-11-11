@@ -31,6 +31,7 @@
 
 #include "smart_deadline.h"
 #include "smart_io_rl.h"
+#include "io_semantics.h"
 #include "smart_io_throttle.h"
 #include "smart_io_prio_policy.h"
 
@@ -1463,6 +1464,8 @@ static void dd_insert_request(struct blk_mq_hw_ctx *hctx, struct request *rq,
 	 * is disabled.
 	 */
 	smart_io_rl_classify_request(rq);
+	/* Must run before the queue class is latched below. */
+	smart_io_keyio_decide(rq);
 	smart_io_throttle_classify_request(&dd->throttle, rq);
 	prio = (enum dd_prio)smart_io_throttle_select_queue(rq);
 	per_prio = &dd->per_prio[prio];

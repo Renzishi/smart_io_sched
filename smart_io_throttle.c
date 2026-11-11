@@ -229,8 +229,6 @@ smart_io_throttle_queue_from_ioprio(u16 ioprio)
 static enum smart_io_queue_class
 smart_io_throttle_floor_queue_class(enum smart_io_queue_class qc, bool is_write)
 {
-	if (!smart_io_throttle_get_inflight_floor())
-		return qc;
 	if (is_write && qc != SMART_IO_QUEUE_HP)
 		return SMART_IO_QUEUE_BE;
 	if (qc == SMART_IO_QUEUE_BE)

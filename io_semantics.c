@@ -3,6 +3,7 @@
 #include <linux/hashtable.h>
 #include <linux/hash.h>
 #include <linux/ioprio.h>
+#include <linux/atomic.h>
 #include <linux/kernel.h>
 #include <linux/kdev_t.h>
 #include <linux/limits.h>
@@ -24,7 +25,7 @@
 
 #include "block_helper.h"
 #include "io_semantics.h"
-#include "keyio_dt_4.h"
+#include "keyio_dt_v5.h"
 #include "smart_io_rl.h"
 #include "smart_io_log.h"
 #include "smart_io_policy.h"
@@ -35,10 +36,98 @@
 #include "tp_pagecache_demo.h"
 #include "tool.h"
 
-static bool keyio_dt4_on;
-module_param(keyio_dt4_on, bool, 0644);
-MODULE_PARM_DESC(keyio_dt4_on,
-		 "Evaluate the depth-4 keyio decision tree on sdc insert (default off)");
+static bool keyio_dt_v5_on;
+module_param(keyio_dt_v5_on, bool, 0644);
+MODULE_PARM_DESC(keyio_dt_v5_on,
+		 "Evaluate the depth-8 keyio v5 tree on sdc insert (default off)");
+
+/* Which op class may be promoted: 0=both, 1=reads only, 2=writes only. */
+static int keyio_mark_op;
+module_param(keyio_mark_op, int, 0644);
+MODULE_PARM_DESC(keyio_mark_op,
+		 "keyio promotion scope: 0=both 1=reads only 2=writes only");
+
+/* Print at most this many tree evaluations (0 = off) for field debugging. */
+static int keyio_debug_n;
+module_param(keyio_debug_n, int, 0644);
+/* Sample 1 in every keyio_debug_every evaluations, so the lines are spread
+ * across the whole capture instead of being rotated out of the ring buffer. */
+static int keyio_debug_every = 1;
+module_param(keyio_debug_every, int, 0644);
+static bool keyio_debug_fg_only = true;
+module_param(keyio_debug_fg_only, bool, 0644);
+MODULE_PARM_DESC(keyio_debug_n,
+		 "Log the first N keyio v5 evaluations with their inputs (0=off)");
+
+/* The teacher was trained on non-main-thread requests only. */
+/* 0 = evaluate any foreground app; otherwise only this uid. */
+static bool keyio_debug_emit = true;
+module_param(keyio_debug_emit, bool, 0644);
+MODULE_PARM_DESC(keyio_debug_emit,
+		 "Emit keyio_verdict / keyio_skip_main lines (default on; off for A/B)");
+
+/*
+ * Set of foreground uids the decision applies to, written as a comma separated
+ * list, e.g. "10232,10271,10272,10273,10274,10275,10276".
+ * An empty list means "any foreground app". Using a set keeps a fg_uid drift
+ * mid-capture from silently changing whether a request is evaluated.
+ */
+#define KEYIO_MAX_TARGET_UIDS 16
+
+static u32 keyio_target_uids[KEYIO_MAX_TARGET_UIDS];
+static int keyio_n_target_uids;
+
+static int keyio_target_uids_set(const char *val, const struct kernel_param *kp)
+{
+	char buf[160];
+	char *p, *tok;
+	int n = 0;
+
+	if (!val)
+		return -EINVAL;
+	strscpy(buf, val, sizeof(buf));
+
+	p = buf;
+	while (p && *p) {
+		unsigned int v;
+
+		tok = strsep(&p, ", ");
+		if (!tok || !*tok)
+			continue;
+		if (kstrtouint(tok, 10, &v))
+			continue;
+		if (n < KEYIO_MAX_TARGET_UIDS)
+			keyio_target_uids[n++] = (u32)v;
+	}
+
+	keyio_n_target_uids = n;
+	return 0;
+}
+
+static const struct kernel_param_ops keyio_target_uids_ops = {
+	.set = keyio_target_uids_set,
+};
+
+module_param_cb(keyio_target_uids, &keyio_target_uids_ops, NULL, 0644);
+MODULE_PARM_DESC(keyio_target_uids,
+		 "Comma separated fg uids to evaluate (empty = any)");
+
+static bool keyio_uid_is_target(u32 uid)
+{
+	int i;
+
+	if (!keyio_n_target_uids)
+		return true;
+	for (i = 0; i < keyio_n_target_uids; i++)
+		if (keyio_target_uids[i] == uid)
+			return true;
+	return false;
+}
+
+static bool keyio_skip_main = true;
+module_param(keyio_skip_main, bool, 0644);
+MODULE_PARM_DESC(keyio_skip_main,
+		 "Skip fg main-thread requests in the keyio decision (default on)");
 
 #define NR_RQ_SHARDS 8
 #define RQ_HASH_BITS 12
@@ -629,6 +718,7 @@ void f2fs_cp_end(void)
 static void emit_raw_insert(const struct smart_io_event *evt,
 				     struct request *rq)
 {
+	char comm[TASK_COMM_LEN];
 	struct smart_io_rl_device_snapshot snapshot;
 	u32 tag_used = 0;
 	u32 tag_max = 0;
@@ -639,6 +729,7 @@ static void emit_raw_insert(const struct smart_io_event *evt,
 		tag_used = snapshot.tag_used;
 		tag_max = snapshot.tag_max;
 	}
+	get_task_comm(comm, current);
 
 	if (evt->thread_role == ROLE_FIO) {
 		smart_io_raw_emit("block_rq_insert: "
@@ -654,8 +745,7 @@ static void emit_raw_insert(const struct smart_io_event *evt,
 			  "sector=%llu ioprio=%u file_ext=%u file_ext_s=%s fg=%u thread_role=%u "
 			  "cpu_cgroup=%u fs_type=%s dev_name=%s remap_from=%s remap_mixed=%u "
 			  "inode_hash=%llu folio_index=%llu tag_max=%u tag_cur=%u "
-			  "r_flt=%u w_flt=%u r_wait=%u w_wait=%u "
-			  "r_lat_us=%u w_lat_us=%u sector_class=%u runqueue=%u\n",
+			  "sector_class=%u runqueue=%u comm=%s\n",
 			  evt->ts_insert, evt->uid, current->pid, current->tgid, (void *)rq,
 			  blk_rq_bytes(rq), rq->cmd_flags, evt->sector, evt->ioprio,
 			  evt->file_ext, evt->file_ext_str, evt->is_front,
@@ -664,9 +754,7 @@ static void emit_raw_insert(const struct smart_io_event *evt,
 			  evt->dev_name, evt->remap_from, evt->remap_mixed,
 			  evt->inode_hash,
 			  evt->folio_index, tag_max, tag_used,
-			  evt->r_flt, evt->w_flt, evt->r_wait, evt->w_wait,
-			  evt->r_lat_us, evt->w_lat_us, evt->sector_class,
-			  evt->runqueue_len);
+			  evt->sector_class, evt->runqueue_len, comm);
 }
 
 static void emit_raw_issue(const struct smart_io_event *evt,
@@ -755,6 +843,254 @@ static void emit_raw_complete(const struct smart_io_event *evt,
 			  evt->io_op, nr_bytes, evt->ts_issue - evt->ts_insert, evt->ts_complete - evt->ts_issue);
 }
 
+/*
+ * keyio: critical-IO decision at the last point where it can still influence
+ * the queue. Called from dd_insert_request() *before* the queue class is
+ * latched, because afterwards only the hint bits change and the HP/RT/BE
+ * assignment is already frozen (see smart_io_throttle_select_queue()).
+ *
+ * sdc only (loop and other devices are excluded), skipping requests that are
+ * already VIP. A positive verdict adds the VIP+PI hints so the request is
+ * classified into the VIP segment.
+ */
+static int keyio_dbg_seen;
+static u64 keyio_dbg_total;
+
+static void keyio_dbg_emit(const char *reason, struct request *rq, u8 out)
+{
+	uid_t dbg_fg = 0;
+	u32 dbg_scene = 0;
+	u32 dbg_uid;
+
+	if (keyio_debug_n <= 0 || keyio_dbg_seen >= keyio_debug_n)
+		return;
+	if (keyio_debug_every > 0 && (keyio_dbg_total % keyio_debug_every) != 0)
+		return;
+
+	/*
+	 * Only log requests of the foreground app: a uniform sample lands almost
+	 * entirely outside the launch window, where other apps and fio dominate.
+	 */
+	if (keyio_debug_fg_only) {
+		smart_io_get_fg_ctx(&dbg_fg, &dbg_scene);
+		dbg_uid = from_kuid(&init_user_ns, current_uid());
+		if (dbg_uid != (u32)dbg_fg)
+			return;
+	}
+	keyio_dbg_seen++;
+	smart_io_raw_emit("keyio_v5_dbg: seq=%d reason=%s op=%u ioprio=%u size=%u fg=%u uid=%u pid=%d tgid=%d out=%u comm=%s\n",
+			  keyio_dbg_seen, reason,
+			  rq ? (op_is_write(req_op(rq)) ? 1u : 0u) : 9u,
+			  rq ? req_get_ioprio(rq) : 0,
+			  rq ? blk_rq_bytes(rq) : 0,
+			  (u32)dbg_fg,
+			  from_kuid(&init_user_ns, current_uid()),
+			  current->pid, current->tgid, out, current->comm);
+}
+
+static void keyio_dbg_emit_bio(const char *reason, struct bio *bio, u8 out)
+{
+	uid_t dbg_fg = 0;
+	u32 dbg_scene = 0;
+	u32 dbg_uid;
+
+	if (keyio_debug_n <= 0 || keyio_dbg_seen >= keyio_debug_n)
+		return;
+	if (keyio_debug_every > 0 && (keyio_dbg_total % keyio_debug_every) != 0)
+		return;
+
+	smart_io_get_fg_ctx(&dbg_fg, &dbg_scene);
+	dbg_uid = from_kuid(&init_user_ns, current_uid());
+	if (keyio_debug_fg_only && dbg_uid != (u32)dbg_fg)
+		return;
+
+	keyio_dbg_seen++;
+	smart_io_raw_emit("keyio_v5_dbg: seq=%d reason=%s src=bio op=%u ioprio=%u size=%u fg=%u uid=%u pid=%d tgid=%d out=%u comm=%s\n",
+			  keyio_dbg_seen, reason,
+			  bio ? bio_op(bio) : 9u,
+			  bio ? bio->bi_ioprio : 0,
+			  bio ? bio->bi_iter.bi_size : 0,
+			  (u32)dbg_fg, dbg_uid,
+			  current->pid, current->tgid, out, current->comm);
+}
+
+/*
+ * Bio-side keyio decision.
+ *
+ * Runs from tp_bio_queue_cb, i.e. before the request exists and therefore before
+ * the queue class is latched, so a VIP hint stamped here actually changes where
+ * the request is dispatched. Only cheap inputs are gathered: bio op/size/ioprio,
+ * the submitter's uid and comm, the runqueue length, the main-thread S flag and
+ * the current cpu.
+ */
+void smart_io_keyio_decide_bio(struct bio *bio)
+{
+	uid_t fg_uid;
+	u32 scene;
+	u32 uid;
+	u16 file_ext;
+	u32 main_is_s;
+	u8 keyio;
+
+	keyio_dbg_total++;
+
+	if (!bio || !keyio_dt_v5_on) {
+		keyio_dbg_emit_bio("off", bio, 9);
+		return;
+	}
+	if (bio_op(bio) != REQ_OP_READ && bio_op(bio) != REQ_OP_WRITE) {
+		keyio_dbg_emit_bio("bad_op", bio, 9);
+		return;
+	}
+	if (!bio->bi_bdev || !bio->bi_bdev->bd_disk ||
+	    strcmp(bio->bi_bdev->bd_disk->disk_name, "sdc")) {
+		keyio_dbg_emit_bio("not_sdc", bio, 9);
+		return;
+	}
+	if (is_vip_ioprio(bio->bi_ioprio)) {
+		keyio_dbg_emit_bio("already_vip", bio, 9);
+		return;
+	}
+	if (keyio_mark_op == 1 && bio_op(bio) == REQ_OP_WRITE) {
+		keyio_dbg_emit_bio("op_gate", bio, 9);
+		return;
+	}
+	if (keyio_mark_op == 2 && bio_op(bio) == REQ_OP_READ) {
+		keyio_dbg_emit_bio("op_gate", bio, 9);
+		return;
+	}
+
+	smart_io_get_fg_ctx(&fg_uid, &scene);
+	if (!keyio_uid_is_target((u32)fg_uid))
+		return;
+
+	uid = from_kuid(&init_user_ns, current_uid());
+
+	if (keyio_skip_main && uid == (u32)fg_uid &&
+	    current->pid == current->tgid) {
+		if (keyio_debug_emit)
+			smart_io_raw_emit("keyio_skip_main: op=%u size=%u uid=%u fg=%u pid=%d tgid=%d comm=%s\n",
+				  bio_op(bio), bio->bi_iter.bi_size,
+				  uid, (u32)fg_uid, current->pid, current->tgid,
+				  current->comm);
+		return;
+	}
+
+	file_ext = extract_first_bio_file_ext(bio);
+	main_is_s = smart_io_rl_main_in_s() ? 1 : 0;
+
+	keyio = keyio_dtv5_predict(bio->bi_iter.bi_size,
+				   bio_op(bio) == REQ_OP_WRITE ? 1 : 0,
+				   bio->bi_ioprio,
+				   get_runqueue_len(),
+				   file_ext,
+				   main_is_s,
+				   uid == (u32)fg_uid ? 1 : 0,
+				   current->comm, smp_processor_id(),
+				   uid);
+
+	if (keyio_debug_emit)
+		smart_io_raw_emit("keyio_verdict: op=%u size=%u ioprio=%u runq=%u fext=%u mis=%u uid=%u fg=%u feq=%u pid=%d tgid=%d out=%u comm=%s\n",
+			  bio_op(bio), bio->bi_iter.bi_size, bio->bi_ioprio,
+			  get_runqueue_len(), file_ext, main_is_s,
+			  uid, (u32)fg_uid, uid == (u32)fg_uid ? 1u : 0u,
+			  current->pid, current->tgid, keyio, current->comm);
+
+	if (keyio)
+		smart_io_mark_bio_vip_pi(bio);
+}
+
+void smart_io_keyio_decide(struct request *rq)
+{
+	char comm[TASK_COMM_LEN];
+	uid_t fg_uid;
+	u32 scene;
+	u32 uid;
+	u16 file_ext;
+	u32 main_is_s;
+	u8 keyio;
+
+	{
+		uid_t dbg_fg = 0;
+		u32 dbg_scene = 0;
+		u32 dbg_uid = from_kuid(&init_user_ns, current_uid());
+
+		smart_io_get_fg_ctx(&dbg_fg, &dbg_scene);
+		if (keyio_debug_emit)
+		smart_io_raw_emit("keyio_rq_enter: op=%u ioprio=%u size=%u fgon=%u uid=%u fg=%u feq=%u pid=%d tgid=%d comm=%s\n",
+				  rq ? (op_is_write(req_op(rq)) ? 1u : 0u) : 99u,
+				  rq ? req_get_ioprio(rq) : 0u,
+				  rq ? blk_rq_bytes(rq) : 0u,
+				  keyio_dt_v5_on ? 1u : 0u,
+				  dbg_uid, (u32)dbg_fg,
+				  dbg_uid == (u32)dbg_fg ? 1u : 0u,
+				  current->pid, current->tgid, current->comm);
+	}
+
+	keyio_dbg_total++;
+
+	if (!rq || !keyio_dt_v5_on) {
+		keyio_dbg_emit("off", rq, 9);
+		return;
+	}
+	if (!rq->q || !rq->q->disk ||
+	    strcmp(rq->q->disk->disk_name, "sdc")) {
+		keyio_dbg_emit("not_sdc", rq, 9);
+		return;
+	}
+	if (is_vip_request(rq)) {
+		keyio_dbg_emit("already_vip", rq, 9);
+		return;
+	}
+	if (keyio_mark_op == 1 && op_is_write(req_op(rq))) {
+		keyio_dbg_emit("op_gate", rq, 9);
+		return;
+	}
+	if (keyio_mark_op == 2 && !op_is_write(req_op(rq))) {
+		keyio_dbg_emit("op_gate", rq, 9);
+		return;
+	}
+
+	smart_io_get_fg_ctx(&fg_uid, &scene);
+	if (!keyio_uid_is_target((u32)fg_uid))
+		return;
+
+	uid = from_kuid(&init_user_ns, current_uid());
+
+	if (keyio_skip_main && uid == (u32)fg_uid &&
+	    current->pid == current->tgid) {
+		keyio_dbg_emit("main", rq, 9);
+		return;
+	}
+
+	get_task_comm(comm, current);
+	file_ext = rq->bio ? extract_first_bio_file_ext(rq->bio)
+			   : SMART_IO_FILE_EXT_UNKNOWN;
+
+	main_is_s = smart_io_rl_main_in_s() ? 1 : 0;
+	keyio = keyio_dtv5_predict(blk_rq_bytes(rq),
+				   op_is_write(req_op(rq)) ? 1 : 0,
+				   req_get_ioprio(rq),
+				   get_runqueue_len(),
+				   file_ext,
+				   main_is_s,
+				   uid == (u32)fg_uid ? 1 : 0,
+				   comm, smp_processor_id(), uid);
+
+	keyio_dbg_emit("decided", rq, keyio);
+
+	if (keyio_debug_emit)
+		smart_io_raw_emit("keyio_rq_verdict: op=%u ioprio=%u size=%u runq=%u fext=%u mis=%u uid=%u fg=%u feq=%u pid=%d tgid=%d out=%u comm=%s\n",
+				  op_is_write(req_op(rq)) ? 1u : 0u,
+				  req_get_ioprio(rq), blk_rq_bytes(rq),
+				  get_runqueue_len(), file_ext, main_is_s,
+				  uid, (u32)fg_uid, uid == (u32)fg_uid ? 1u : 0u,
+				  current->pid, current->tgid, keyio, comm);
+
+	if (keyio)
+		mark_request_vip_pi(rq);
+}
+
 static void fill_record_from_current(struct rq_record *rec, struct request *rq,
 				     bool direct_path,
 				     const struct remap_info *remap)
@@ -820,27 +1156,6 @@ static void fill_record_from_current(struct rq_record *rec, struct request *rq,
 		evt->w_lat_us = rl_device.w_lat_us;
 	}
 
-	/* keyio_dt4: depth-4 distilled critical-IO decision tree at the
-	 * DNN's F1-max operating point. sdc only, to keep loop-merged
-	 * requests out of the backend-device decision. Default off.
-	 * VIP requests are skipped; a keyio verdict marks the request
-	 * with the VIP+PI hints. */
-	if (keyio_dt4_on && !strcmp(evt->dev_name, "sdc")) {
-		u8 keyio = 0;
-
-		if (!is_vip_request(rq)) {
-			keyio = keyio_dt4_predict(evt->runqueue_len,
-						  smart_io_rl_main_in_s() ? 1 : 0,
-						  evt->ioprio, comm,
-						  evt->file_ext, fg_uid,
-						  smp_processor_id());
-			if (keyio) {
-				mark_request_vip_pi(rq);
-				evt->ioprio = req_get_ioprio(rq);
-			}
-		}
-		evt->keyio_dt4 = keyio;
-	}
 
 	if (raw_mode_enabled())
 		return;

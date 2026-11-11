@@ -39,8 +39,11 @@ void f2fs_cp_begin(void);
 void f2fs_cp_end(void);
 void smart_io_clear_remap_state(void);
 
+void smart_io_keyio_decide(struct request *rq);
+void smart_io_keyio_decide_bio(struct bio *bio);
 void smart_io_get_io_stats(u32 *insert, u32 *issue, u32 *complete,
 			   u32 *waiting, u32 *in_flight, u32 *lost_complete);
 int smart_io_read_latest_event(struct smart_io_event *dst);
+
 
 #endif

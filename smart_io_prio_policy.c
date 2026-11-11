@@ -189,6 +189,20 @@ static void mark_bio_sched_exempt(struct bio *bio)
 		bio->bi_opf |= SMART_IO_OPF_SCHED_EXEMPT;
 }
 
+/*
+ * Bio-side equivalent of mark_request_vip_pi(): used by the keyio decision,
+ * which runs from the bio hook so that the hint is visible before the queue
+ * class is latched.
+ */
+void smart_io_mark_bio_vip_pi(struct bio *bio)
+{
+	if (!bio)
+		return;
+	bio->bi_ioprio = set_private_hint(bio->bi_ioprio,
+			SMART_IO_VIP_IOPRIO_HINT | SMART_IO_PI_IOPRIO_HINT);
+	mark_bio_sched_exempt(bio);
+}
+
 void smart_io_mark_bio_hint(struct bio *bio)
 {
 	mark_bio_pgf(bio);
@@ -220,8 +234,6 @@ void smart_io_mark_bio_hint(struct bio *bio)
 
 void smart_io_mark_bio_write(struct bio *bio)
 {
-	if (smart_io_throttle_get_inflight_floor())
-		return;
 	if (bio_op(bio) != REQ_OP_WRITE)
 		return;
 	if (!(bio->bi_opf & REQ_SYNC) ||
