@@ -1,6 +1,8 @@
 #include <linux/bio.h>
 #include <linux/blk-mq.h>
+#include <linux/atomic.h>
 #include <linux/errno.h>
+#include <linux/fs.h>
 #include <linux/ioprio.h>
 #include <linux/kernel.h>
 #include <linux/ktime.h>
@@ -41,6 +43,14 @@ module_param(fgpp_oneshot, int, 0644);
 MODULE_PARM_DESC(fgpp_oneshot,
 		 "Drop the mark after the first protection (0=keep, 1=one chance)");
 
+static bool fgpp_main_only;
+module_param(fgpp_main_only, bool, 0644);
+MODULE_PARM_DESC(fgpp_main_only,
+		 "Mark only read bios carrying the foreground-main source hint");
+
+static atomic64_t fgpp_mark_count = ATOMIC64_INIT(0);
+static atomic64_t fgpp_protect_count = ATOMIC64_INIT(0);
+
 static bool fgpp_mark_this(const struct request *rq)
 {
 	u16 ioprio;
@@ -69,17 +79,41 @@ static void fgpp_rq_insert_cb(void *data, struct request *rq)
 	(void)data;
 	if (!fg_page_protect_on || !rq)
 		return;
-	if (!fgpp_mark_this(rq))
-		return;
 
 	__rq_for_each_bio(bio, rq) {
+		if (fgpp_main_only) {
+			if (bio_op(bio) != REQ_OP_READ ||
+			    !(IOPRIO_PRIO_HINT(bio->bi_ioprio) &
+			      SMART_IO_MAIN_IOPRIO_HINT))
+				continue;
+		} else if (!fgpp_mark_this(rq)) {
+			return;
+		}
+
 		bio_for_each_segment(bvl, bio, iter) {
+			u64 count;
+
 			folio = page_folio(bvl.bv_page);
-			if (folio_test_anon(folio))
+			if (folio_test_anon(folio) || folio_test_swapcache(folio))
 				continue;
-			if (folio_test_swapcache(folio))
+			if (test_and_set_bit(PG_oem_reserved_1, &folio->flags))
 				continue;
-			set_bit(PG_oem_reserved_1, &folio->flags);
+
+			count = atomic64_inc_return(&fgpp_mark_count);
+			if (atomic_read(&rawdata_trace_enabled) && !(count & 1023)) {
+				struct address_space *mapping = folio_mapping(folio);
+				struct inode *inode = mapping ? mapping->host : NULL;
+				u64 inode_hash = 0;
+
+				if (inode && inode->i_sb)
+					inode_hash = (u64)inode->i_ino ^
+						((u64)inode->i_sb->s_dev << 32);
+				smart_io_raw_emit("fgpp_mark_sample: ts=%llu count=%llu inode_hash=%llu index=%llu pages=%u\n",
+						  ktime_get_boottime_ns(), count,
+						  inode_hash, (u64)folio->index,
+						  (u32)min_t(unsigned long,
+							folio_nr_pages(folio), U32_MAX));
+			}
 		}
 	}
 }
@@ -88,6 +122,8 @@ static void fgpp_shrink_cb(void *data, struct folio *folio,
 			   bool dirty, bool writeback,
 			   bool *activate, bool *keep)
 {
+	u64 count;
+
 	(void)data;
 	(void)keep;
 
@@ -101,12 +137,21 @@ static void fgpp_shrink_cb(void *data, struct folio *folio,
 	*activate = true;
 	if (fgpp_oneshot)
 		clear_bit(PG_oem_reserved_1, &folio->flags);
-	if (atomic_read(&rawdata_trace_enabled))
-		smart_io_raw_emit("fgpp_protect: ts=%llu index=%llu pages=%u\n",
-				  ktime_get_boottime_ns(),
+	count = atomic64_inc_return(&fgpp_protect_count);
+	if (atomic_read(&rawdata_trace_enabled) && !(count & 1023)) {
+		struct address_space *mapping = folio_mapping(folio);
+		struct inode *inode = mapping ? mapping->host : NULL;
+		u64 inode_hash = 0;
+
+		if (inode && inode->i_sb)
+			inode_hash = (u64)inode->i_ino ^
+				((u64)inode->i_sb->s_dev << 32);
+		smart_io_raw_emit("fgpp_protect_sample: ts=%llu count=%llu inode_hash=%llu index=%llu pages=%u\n",
+				  ktime_get_boottime_ns(), count, inode_hash,
 				  (u64)folio->index,
 				  (u32)min_t(unsigned long, folio_nr_pages(folio),
 					     U32_MAX));
+	}
 }
 
 static void fgpp_delete_cb(void *data, struct folio *folio)

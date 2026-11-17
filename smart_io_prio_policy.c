@@ -81,13 +81,13 @@ static bool __maybe_unused is_special_read(u16 ioprio, blk_opf_t opf,
 static bool current_can_mark_hp(u16 ioprio,
 						  blk_opf_t opf, unsigned int op)
 {
-	// return current_uid_is_fg();
+	return current_uid_is_fg();
 	// return current_uid_is_fg() ||
 	// 	is_special_read(ioprio, opf, op);
-	u16 hint = IOPRIO_PRIO_HINT(ioprio);
-	if (hint & (SMART_IO_PGF_IOPRIO_HINT | SMART_IO_PI_IOPRIO_HINT))
-		return true;
-	return current_is_ux();
+	// u16 hint = IOPRIO_PRIO_HINT(ioprio);
+	// if (hint & (SMART_IO_PGF_IOPRIO_HINT | SMART_IO_PI_IOPRIO_HINT))
+	// 	return true;
+	// return current_is_ux();
 }
 
 static bool current_can_mark_vip(u16 ioprio,
